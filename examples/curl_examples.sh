@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# 冷链追责服务 调用示例（curl）。
+# 用法：BASE=http://127.0.0.1:8000 bash examples/curl_examples.sh
+set -euo pipefail
+BASE="${BASE:-http://127.0.0.1:8000}"
+C="COLD-DEMO-1"
+
+echo "1) 创建货物：编号 / 起始时间 / 温度上限 / 起始保管方"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$C\",
+  \"started_at\": \"2026-09-30T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}"; echo
+
+echo "2) 测温（10:00，8.2℃ > 上限 4℃，开启越温区间）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-temp-1\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T10:00:00+08:00\", \"temperature\": \"8.2\"
+}"; echo
+
+echo "3) 交接（12:00，北京冷库 -> 上海冷库），区间在此刻拆分"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-hand-1\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T12:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}"; echo
+
+echo "4) 交接（14:00，上海冷库 -> 广州冷库）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-hand-2\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T14:00:00+08:00\",
+  \"giver\": \"上海冷库\", \"receiver\": \"广州冷库\"
+}"; echo
+
+echo "5) 测温（16:00，3.1℃ <= 上限，闭合越温区间）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-temp-2\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T16:00:00+08:00\", \"temperature\": \"3.1\"
+}"; echo
+
+echo "6) 幂等重传第 2) 步（相同内容返回 200 replayed，不重复写入）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-temp-1\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T10:00:00+08:00\", \"temperature\": \"8.2\"
+}"; echo
+
+echo "7) 追责报告：越温起止 + 各责任方片段（按时间）"
+curl -sS "$BASE/cargo/$C/report"; echo
+
+echo "8) 责任确认查询：已闭合区间（区间标识=开启测温事件ID）、结束事件ID、责任片段、当前快照标识、最新表态、汇总状态"
+curl -sS "$BASE/cargo/$C/responsibilities"; echo
+
+# 取首个已闭合区间的区间标识与当前快照标识（需系统带 python3；也可手工从上一步复制）
+read -r IID SNAP < <(python3 - "$BASE" "$C" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    iv = json.load(r)["intervals"][0]
+print(iv["interval_id"], iv["snapshot_id"])
+PY
+)
+echo "区间标识=$IID 快照标识=$SNAP"
+
+echo "9) 北京冷库 确认担责"
+curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$SNAP\",
+    \"responsible_party\": \"北京冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-bj-1\"
+  }"; echo
+
+echo "10) 上海冷库 提出异议（异议必须带理由 reason）"
+curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$SNAP\",
+    \"responsible_party\": \"上海冷库\",
+    \"stance\": \"dispute\",
+    \"reason\": \"该时段冷机由北京冷库远程设定，上海冷库未接管温控\",
+    \"stance_id\": \"stance-sh-1\"
+  }"; echo
+
+echo "11) 再次查询：汇总状态变为 has_dispute，各责任方返回最新一条有效表态"
+curl -sS "$BASE/cargo/$C/responsibilities/$IID"; echo
+
+echo "12) 表态历史：改口用新编号，历次表态（含已改口/已失效）均可查"
+curl -sS "$BASE/cargo/$C/responsibilities/$IID/stances"; echo
+
+echo "13) 幂等：同编号同内容重传返回原记录（200 replayed，即使快照随后失效也如此）"
+curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$SNAP\",
+    \"responsible_party\": \"北京冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-bj-1\"
+  }"; echo
+
+echo "14) 改口：上海冷库改为确认（必须使用新表态编号，携带新编号提交）"
+curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$SNAP\",
+    \"responsible_party\": \"上海冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-sh-2\"
+  }"; echo
+
+echo "15) 最终查询：北京/上海均已确认；广州冷库尚未表态 -> 汇总仍为 pending（待确认）"
+curl -sS "$BASE/cargo/$C/responsibilities/$IID"; echo
+
+echo "16) 广州冷库也确认 -> 汇总 all_confirmed"
+curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$SNAP\",
+    \"responsible_party\": \"广州冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-gz-1\"
+  }" >/dev/null
+curl -sS "$BASE/cargo/$C/responsibilities/$IID"; echo
+
+echo
+echo "================ 本轮新增：车次 / 装卸时段 / 车载测温 ================"
+# 演示货物：两票同车货物，温度上限不同（C-A 4℃，C-B 8℃）
+CA="COLD-CAR-A"; CB="COLD-CAR-B"; TRIP="TRUCK-DEMO-1"
+for CC in "$CA" "$CB"; do
+  LIM="4.0"; [ "$CC" = "$CB" ] && LIM="8.0"
+  curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+    \"cargo_id\": \"$CC\",
+    \"started_at\": \"2026-09-30T08:00:00+08:00\",
+    \"temp_upper_limit\": \"$LIM\",
+    \"initial_holder\": \"北京冷库\"
+  }" >/dev/null
+done
+
+echo "17) 登记车次（车牌号）"
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$TRIP\",
+  \"vehicle_no\": \"京B-冷888\",
+  \"note\": \"9月30日 京沪冷链班\"
+}"; echo
+
+echo "18) 批量登记两票货物的装卸时段（左闭右开，同一货物不得跨车次重叠）"
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" \
+  -H 'Content-Type: application/json' -d "{
+    \"items\": [
+      {\"cargo_id\": \"$CA\",
+       \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"},
+      {\"cargo_id\": \"$CB\",
+       \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"}
+    ]
+  }"; echo
+
+echo "19) 非法时段（起点不早于终点）整批拒绝：422 invalid_loading_window，不留部分记录"
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" \
+  -H 'Content-Type: application/json' -d "{
+    \"items\": [
+      {\"cargo_id\": \"$CA\",
+       \"loaded_at\": \"2026-09-30T19:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T19:00:00+08:00\"}
+    ]
+  }"; echo
+
+echo "20) 车载读数 7℃（允许晚到）：回执 affected_cargo_ids 给出读数时刻仍在车上的货物"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-1\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T10:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}"; echo
+
+echo "21) 车载读数幂等重传（同编号同内容 -> 200 replayed）"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-1\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T10:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}"; echo
+
+echo "22) 同刻自有测温优先：$CA 在 11:00 有自有测温 3.1℃，车载 7℃ 读数对其被取代但原始可查"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"ca-own-1\", \"cargo_id\": \"$CA\",
+  \"occurred_at\": \"2026-09-30T11:00:00+08:00\", \"temperature\": \"3.1\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-2\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T11:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}" >/dev/null
+
+echo "23) 交接仍只由货物自有事件改变保管方（12:00 北京冷库 -> 上海冷库，两票货物各写一笔）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"ca-h1\", \"cargo_id\": \"$CA\",
+  \"occurred_at\": \"2026-09-30T12:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"cb-h1\", \"cargo_id\": \"$CB\",
+  \"occurred_at\": \"2026-09-30T12:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+
+echo "24) 车载 3℃ 读数闭合两票货物的越温区间"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-3\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T14:00:00+08:00\",
+  \"temperature\": \"3.0\"
+}"; echo
+
+echo "25) 车次详情：车载原始读数 + 每笔读数对各货物的适用性 / 是否采用 / 是否越温"
+curl -sS "$BASE/trips/$TRIP" | python3 -m json.tool; echo
+
+echo "26) $CA 合并读数时间线（vr-2 同刻被自有测温取代：adopted=false，原始仍列出）"
+curl -sS "$BASE/cargo/$CA/timeline" | python3 -m json.tool; echo
+
+echo "27) $CA 追责报告：10:00 车载开启越温（区间标识 veh:vr-1），14:00 车载闭合，跨交接拆分"
+curl -sS "$BASE/cargo/$CA/report"; echo
+echo "    $CB 上限 8℃，7℃ 全程不越温："
+curl -sS "$BASE/cargo/$CB/report"; echo
+
+echo "28) 对车载读数开启的区间（veh:vr-1）查询并提交责任表态"
+VSNAP=$(curl -sS "$BASE/cargo/$CA/responsibilities" | python3 -c 'import json,sys; print(json.load(sys.stdin)["intervals"][0]["snapshot_id"])')
+curl -sS -X POST "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$VSNAP\",
+    \"responsible_party\": \"北京冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-ca-bj-1\"
+  }"; echo
+curl -sS "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances"; echo
+
+echo
+echo "================ 本轮新增：质控同时越温查询 ================"
+# 再挂一票上限 4℃ 的货物 Q 到同一车次（CA 上限 4℃、CB 上限 8℃）
+CQ="COLD-CAR-Q"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$CQ\",
+  \"started_at\": \"2026-09-30T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"cargo_id\": \"$CQ\",
+     \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+     \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"}
+  ]
+}" >/dev/null
+
+# 回顾已有读数：10:00 车载 7℃（CA、Q 越温；CB 上限 8℃ 不越）；
+# 11:00 CA 有自有 3.1℃ 测温 -> CA 此时刻闭合（同刻车载 7℃ 对 CA 被取代），Q 仍越温；
+# 14:00 车载 3℃ -> Q 闭合。
+echo "29) 同时越温时段（min_cargo 默认 2）：仅 10:00-11:00 [CA,Q] 两票同时越温"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" | python3 -m json.tool; echo
+
+echo "30) 查询窗裁剪（09:30-10:30）：片段被裁到查询窗内"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T09:30:00+08:00" \
+  --data-urlencode "end_at=2026-09-30T10:30:00+08:00" | python3 -m json.tool; echo
+
+echo "31) 门槛 3（min_cargo=3）：CB 上限 8℃ 全程不越温，无三票同时段 -> 空结果"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=3"; echo
+
+echo "32) 错误示例：未知车次 / 终点不晚于起点 / 门槛非法 / 缺时区"
+curl -sS -G "$BASE/trips/NO-TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-09-30T00:00:00+08:00"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=1"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
