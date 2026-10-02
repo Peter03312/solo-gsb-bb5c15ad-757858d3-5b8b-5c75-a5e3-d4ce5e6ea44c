@@ -283,3 +283,84 @@ curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
 curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
   --data-urlencode "start_at=2026-09-30T00:00:00" \
   --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
+
+echo
+echo "================ 本轮新增：测温值更正（只改温度） ================"
+
+echo "33) 更正自有测温 evt-temp-1：原录 8.2℃ 录错，expected_version=0（首次）改为 3.8℃"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-ca-1\",
+  \"target_type\": \"own_event\",
+  \"target_id\": \"evt-temp-1\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"3.8\"
+}"; echo
+
+echo "34) 原始记录查询：temperature 仍是原值 8.2，另给 effective_temperature/version"
+curl -sS "$BASE/cargo/$C/events" | python3 -m json.tool; echo
+
+echo "35) 原始记录及历次更正可查（按版本升序）"
+curl -sS "$BASE/events/evt-temp-1/corrections" | python3 -m json.tool; echo
+
+echo "36) 追责报告按有效值重建：8.2℃ 开启的越温区间消失（3.8 <= 上限 4）"
+curl -sS "$BASE/cargo/$C/report"; echo
+
+echo "37) 同更正ID同内容重传 -> 200 replayed（返回原结果）；异内容 -> 409"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-ca-1\",
+  \"target_type\": \"own_event\",
+  \"target_id\": \"evt-temp-1\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"3.8\"
+}"; echo
+
+echo "38) 期望版本过期（当前为 1，仍传 0）-> 409 stale_version，不落部分结果"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-ca-2\",
+  \"target_type\": \"own_event\",
+  \"target_id\": \"evt-temp-1\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"3.5\"
+}"; echo
+
+echo "39) 交接不可更正 -> 422 handover_not_correctable"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-h-1\",
+  \"target_type\": \"own_event\",
+  \"target_id\": \"evt-hand-1\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"3.5\"
+}"; echo
+
+echo "40) 原事件按原内容重传仍幂等（temperature 比较仍按原始 8.2，不看更正值）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"evt-temp-1\", \"cargo_id\": \"$C\",
+  \"occurred_at\": \"2026-09-30T10:00:00+08:00\", \"temperature\": \"8.2\"
+}"; echo
+
+echo "41) 车载读数更正：vr-1 原录 7.0，改为 2.0——同时影响读数时刻在车的全部货物"
+curl -sS -X POST "$BASE/corrections" -H 'Content-Type: application/json' -d "{
+  \"correction_id\": \"corr-vr-1\",
+  \"target_type\": \"vehicle_reading\",
+  \"target_id\": \"vr-1\",
+  \"expected_version\": 0,
+  \"new_temperature\": \"2.0\"
+}"; echo
+
+echo "42) 车载原始读数及历次更正可查；车次详情原始温度 7.0 不变、有效温度 2.0/版本 1"
+curl -sS "$BASE/vehicle-readings/vr-1/corrections" | python3 -m json.tool; echo
+curl -sS "$BASE/trips/$TRIP" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for r in d["readings"]:
+    if r["reading_id"] == "vr-1":
+        print("vr-1 原始温度 =", r["temperature"],
+              "有效温度 =", r["effective_temperature"], "版本 =", r["version"])
+'
+
+echo "43) 货物时间线按有效值重建（车载点 temperature=更正值 2.0、version=1）"
+curl -sS "$BASE/cargo/$CA/timeline" | python3 -c '
+import json, sys
+for p in json.load(sys.stdin)["points"]:
+    if p["reading_id"] == "vr-1":
+        print("vr-1 时间线温度 =", p["temperature"], "版本 =", p["version"])'

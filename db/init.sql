@@ -5,6 +5,7 @@
 CREATE TYPE event_type AS ENUM ('measurement', 'handover');
 CREATE TYPE stance_kind AS ENUM ('confirm', 'dispute');
 CREATE TYPE interval_source AS ENUM ('own', 'vehicle');
+CREATE TYPE correction_target AS ENUM ('own_event', 'vehicle_reading');
 
 CREATE TABLE IF NOT EXISTS cargo (
     cargo_id          VARCHAR(64)   PRIMARY KEY,
@@ -139,3 +140,54 @@ CREATE TABLE IF NOT EXISTS responsibility_stance (
 
 CREATE INDEX IF NOT EXISTS ix_stance_cargo_interval
     ON responsibility_stance (cargo_id, interval_key);
+
+-- 测温值更正（append-only：原始测温/读数永不修改，有效温度取最新更正）。
+-- 只改温度，时间、归属与原编号不变；交接不可更正（应用侧拒绝，无目标行）。
+CREATE TABLE IF NOT EXISTS temperature_correction (
+    correction_id       VARCHAR(64)   PRIMARY KEY,
+    target_type         correction_target NOT NULL,
+    -- own_event 目标坐标
+    cargo_id            VARCHAR(64),
+    target_event_id     VARCHAR(64),
+    -- vehicle_reading 目标坐标
+    target_reading_id   VARCHAR(64),
+    trip_id             VARCHAR(64),
+    -- 乐观锁：提交时目标的当前更正版本（首次为 0）；更正后的版本（=期望值+1）
+    expected_version    INTEGER       NOT NULL,
+    version             INTEGER       NOT NULL,
+    new_temperature     NUMERIC(10,3) NOT NULL,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_correction_shape CHECK (
+        new_temperature IS NOT NULL
+        AND expected_version >= 0
+        AND version >= 1
+    ),
+
+    -- 目标坐标二选一：自有测温事件（无读数/车次坐标）或车载读数（无货物/事件坐标）
+    CONSTRAINT chk_correction_target CHECK (
+        (target_type = 'own_event'
+            AND target_event_id IS NOT NULL
+            AND target_reading_id IS NULL
+            AND trip_id IS NULL)
+        OR
+        (target_type = 'vehicle_reading'
+            AND target_reading_id IS NOT NULL
+            AND trip_id IS NOT NULL
+            AND target_event_id IS NULL
+            AND cargo_id IS NULL)
+    )
+);
+
+-- 每个目标下版本号唯一（应用侧在货物行锁 / 车次行锁内按序号分配）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_correction_event_version
+    ON temperature_correction (target_event_id, version);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_correction_reading_version
+    ON temperature_correction (target_reading_id, version);
+
+CREATE INDEX IF NOT EXISTS ix_correction_event
+    ON temperature_correction (target_event_id, created_at, correction_id);
+
+CREATE INDEX IF NOT EXISTS ix_correction_reading
+    ON temperature_correction (target_reading_id, created_at, correction_id);

@@ -7,8 +7,14 @@
 * 同一时刻该货物有自有测温时，**优先采用自有测温**；车载读数在该时刻对该货物
   标记 ``adopted=False``（被取代），不参与越温重建，但原始读数仍可查询。
 * 交接事件只来自货物自有事件，车载读数从不改变保管方。
+* **测温更正生效于有效温度**：测温点的温度取该自有测温 / 车载读数最新一次
+  更正后的有效温度（无更正时为原始温度）。同刻自有测温优先仍只取决于“该时刻
+  是否存在自有测温”，与温度取值无关；被取代的车载点同样携带更正后的有效温度
+  与版本（仅用于展示，不参与重建）。
 """
 from __future__ import annotations
+
+from decimal import Decimal
 
 from app.chain import (
     SOURCE_OWN,
@@ -39,35 +45,66 @@ def onboard_loadings(loadings, at) -> list:
     return [l for l in loadings if is_on_board(l, at)]
 
 
-def merged_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoint]:
+def merged_timeline(
+    own_events,
+    vehicle_readings,
+    loadings,
+    event_effective: dict[str, tuple] | None = None,
+    reading_effective: dict[str, tuple] | None = None,
+) -> list[TimelinePoint]:
     """生成货物的完整读数时间线（含被取代的车载点，按时间升序）。
 
     :param own_events: 该货物的全部自有事件（测温 / 交接）。
     :param vehicle_readings: 该货物所有车次的车载原始读数（可含与其无关车次的，
         由 loadings 决定是否适用）。
     :param loadings: 该货物的全部装卸时段登记。
+    :param event_effective: 自有测温事件ID -> ``(有效温度, 版本)``，
+        仅含发生过更正的测温；缺失即原始温度、版本 0。
+    :param reading_effective: 车载读数ID -> ``(有效温度, 版本)``，语义同上。
     """
-    points: list[TimelinePoint] = [point_from_event(e) for e in own_events]
-    own_measure_at = {
-        e.occurred_at
-        for e in own_events
-        if point_from_event(e).is_measurement
-    }
+    event_effective = event_effective or {}
+    reading_effective = reading_effective or {}
+
+    points: list[TimelinePoint] = []
+    own_measure_at = set()
+    for e in own_events:
+        p = point_from_event(e)
+        if p.is_measurement:
+            own_measure_at.add(e.occurred_at)
+            eff = event_effective.get(e.event_id)
+            if eff is not None:
+                p = TimelinePoint(
+                    occurred_at=p.occurred_at,
+                    is_measurement=True,
+                    temperature=Decimal(eff[0]),
+                    source=SOURCE_OWN,
+                    source_id=e.event_id,
+                    adopted=True,
+                    temp_version=eff[1],
+                )
+        points.append(p)
+
     for r in vehicle_readings:
         # 必须在“同一车次”的装卸时段内且读数时刻仍在车上
         applicable = any(is_reading_applicable(l, r) for l in loadings)
         if not applicable:
             # 与该货物无关的车次读数（不在车 / 别的车次）完全不出现在其时间线上
             continue
+        eff = reading_effective.get(r.reading_id)
+        if eff is not None:
+            temperature, r_version = Decimal(eff[0]), eff[1]
+        else:
+            temperature, r_version = Decimal(r.temperature), 0
         points.append(
             TimelinePoint(
                 occurred_at=r.read_at,
                 is_measurement=True,
-                temperature=r.temperature,
+                temperature=temperature,
                 source=SOURCE_VEHICLE,
                 source_id=r.reading_id,
                 trip_id=r.trip_id,
                 adopted=r.read_at not in own_measure_at,
+                temp_version=r_version,
             )
         )
     points.sort(
@@ -81,17 +118,37 @@ def merged_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoin
     return points
 
 
-def adopted_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoint]:
+def adopted_timeline(
+    own_events,
+    vehicle_readings,
+    loadings,
+    event_effective: dict[str, tuple] | None = None,
+    reading_effective: dict[str, tuple] | None = None,
+) -> list[TimelinePoint]:
     """只含被采用点的时间线，供保管链重建使用。"""
-    return [p for p in merged_timeline(own_events, vehicle_readings, loadings)
-            if p.adopted]
+    return [
+        p
+        for p in merged_timeline(
+            own_events,
+            vehicle_readings,
+            loadings,
+            event_effective,
+            reading_effective,
+        )
+        if p.adopted
+    ]
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数。"""
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数与测温更正有效值。
+
+    返回 ``(events, loadings, readings, effective)``；``effective`` 为
+    ``(event_effective, reading_effective)`` 两个映射，键分别为自有测温事件ID
+    与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过更正的目标。
+    """
     from sqlalchemy import select
 
-    from app.models import Event, Loading, Trip, VehicleReading
+    from app.models import Event, Loading, TemperatureCorrection, Trip, VehicleReading
     from app.timeutil import ensure_utc
 
     events = list(
@@ -130,7 +187,69 @@ def load_cargo_context(db, cargo_id: str):
         # 仅按关系惰性引用，trip 行由车次查询单独获取
         readings = rows
 
-    return events, loadings, readings
+    effective = load_effective_maps(
+        db,
+        event_ids={
+            e.event_id for e in events
+            if getattr(e.event_type, "name", e.event_type) == "measurement"
+        },
+        reading_ids={r.reading_id for r in readings},
+    )
+    return events, loadings, readings, effective
+
+
+def load_effective_maps(db, event_ids=None, reading_ids=None):
+    """读取目标测温的当前有效值：``(event_effective, reading_effective)``。
+
+    每个映射的值为 ``(Decimal 有效温度, int 当前版本)``，只含存在更正的目标。
+    同一目标取 ``version`` 最大（= 最新一次更正）的一条。
+    """
+    from sqlalchemy import select
+
+    from app.models import CorrectionTarget, TemperatureCorrection
+
+    event_effective: dict[str, tuple] = {}
+    reading_effective: dict[str, tuple] = {}
+
+    if event_ids:
+        rows = db.scalars(
+            select(TemperatureCorrection)
+            .where(
+                TemperatureCorrection.target_type
+                == CorrectionTarget.own_event,
+                TemperatureCorrection.target_event_id.in_(event_ids),
+            )
+        ).all()
+        latest: dict[str, TemperatureCorrection] = {}
+        for row in rows:
+            prev = latest.get(row.target_event_id)
+            if prev is None or row.version > prev.version:
+                latest[row.target_event_id] = row
+        event_effective = {
+            eid: (Decimal(row.new_temperature), row.version)
+            for eid, row in latest.items()
+        }
+
+    if reading_ids:
+        rows = db.scalars(
+            select(TemperatureCorrection)
+            .where(
+                TemperatureCorrection.target_type
+                == CorrectionTarget.vehicle_reading,
+                TemperatureCorrection.target_reading_id.in_(reading_ids),
+            )
+        ).all()
+        latest = {}
+        for row in rows:
+            prev = latest.get(row.target_reading_id)
+            if prev is None or row.version > prev.version:
+                latest[row.target_reading_id] = row
+        reading_effective = {
+            rid: (Decimal(row.new_temperature), row.version)
+            for rid, row in latest.items()
+        }
+
+    return event_effective, reading_effective
 
 
 def resolve_trip_for_reading(db, trip_id: str):

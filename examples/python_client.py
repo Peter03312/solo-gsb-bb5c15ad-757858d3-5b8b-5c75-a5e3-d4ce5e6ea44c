@@ -395,6 +395,85 @@ def main() -> None:
             ),
         )
 
+        # ==================== 测温值更正（只改温度） ====================
+        # 10:00 的车载读数 py-vr1 原录 7.0：把 A（上限 4）开启了越温区间。
+        # 若该值录错（实际 2.0），凭读数ID + 更正ID + 期望版本(首次为 0)提交：
+        show(
+            "车载读数更正 7.0 -> 2.0（同时影响读数时刻在车的全部货物）",
+            api.post(
+                "/corrections",
+                json={
+                    "correction_id": "py-corr-vr1",
+                    "target_type": "vehicle_reading",
+                    "target_id": "py-vr1",
+                    "expected_version": 0,
+                    "new_temperature": "2.0",
+                },
+            ),
+        )
+        # 同内容重传 -> 200 replayed；版本过期 / 异内容 -> 409
+        show(
+            "车载更正幂等重传",
+            api.post(
+                "/corrections",
+                json={
+                    "correction_id": "py-corr-vr1",
+                    "target_type": "vehicle_reading",
+                    "target_id": "py-vr1",
+                    "expected_version": 0,
+                    "new_temperature": "2.0",
+                },
+            ),
+        )
+        show(
+            "车载读数原始记录及历次更正",
+            api.get("/vehicle-readings/py-vr1/corrections"),
+        )
+        show(
+            "车次详情（原始 7.0 不变，有效温度 2.0 / 版本 1）",
+            api.get(f"/trips/{trip}"),
+        )
+        show(
+            "更正后货物 A 追责报告（10:00 不再越温，区间按有效值重建）",
+            api.get(f"/cargo/{cargo_a}/report"),
+        )
+
+        # 自有测温更正：CARGO 的 p-t1 原录 8.2 改为 3.8（< 上限 4）
+        show(
+            "自有测温更正 8.2 -> 3.8（expected_version=0）",
+            api.post(
+                "/corrections",
+                json={
+                    "correction_id": "py-corr-own-1",
+                    "target_type": "own_event",
+                    "target_id": "p-t1",
+                    "expected_version": 0,
+                    "new_temperature": "3.8",
+                },
+            ),
+        )
+        show(
+            "自有事件列表（temperature=原始值，effective_temperature/version=有效值）",
+            api.get(f"/cargo/{CARGO}/events"),
+        )
+        show(
+            "自有测温历次更正",
+            api.get("/events/p-t1/corrections"),
+        )
+        show(
+            "交接不可更正（422 handover_not_correctable）",
+            api.post(
+                "/corrections",
+                json={
+                    "correction_id": "py-corr-hand",
+                    "target_type": "own_event",
+                    "target_id": "p-h1",
+                    "expected_version": 0,
+                    "new_temperature": "3.8",
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     main()

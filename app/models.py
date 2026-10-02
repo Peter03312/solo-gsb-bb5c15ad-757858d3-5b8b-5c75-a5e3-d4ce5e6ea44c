@@ -39,6 +39,13 @@ class IntervalSource(str, enum.Enum):
     vehicle = "vehicle"    # 车载测温读数
 
 
+class CorrectionTarget(str, enum.Enum):
+    """测温更正的目标类型。"""
+
+    own_event = "own_event"          # 货物自有测温事件
+    vehicle_reading = "vehicle_reading"  # 车载测温读数
+
+
 class Cargo(Base):
     __tablename__ = "cargo"
 
@@ -263,6 +270,86 @@ class Stance(Base):
     # 表态时该责任方承担的片段坐标（规范化 JSON：[[start,end,party],...]）。
     # 晚到事件重建后据此逐片段判定表态是否仍有效（未变化片段继续有效）。
     attested_segments: Mapped[str] = mapped_column(String(2000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class TemperatureCorrection(Base):
+    """测温值更正（append-only）：只改温度，时间 / 归属 / 原编号均不变。
+
+    目标为一笔货物**自有测温事件**（``target_type='own_event'``，
+    target_event_id 有值）或一笔**车载读数**（``target_type='vehicle_reading'``，
+    target_reading_id 有值，记录所属车次）。交接事件不可更正，由应用侧拒绝。
+
+    ``expected_version`` 为乐观锁：必须等于提交时目标的当前更正版本
+    （首次更正为 0，随后依次递增）；``version`` 为本次更正后的版本
+    （= expected_version + 1，也等于该目标下更正的写入序号）。
+    原始测温 / 读数永不修改，当前有效温度取最新一条更正的 new_temperature；
+    无更正时有效温度即原始温度、版本为 0。
+    """
+
+    __tablename__ = "temperature_correction"
+    __table_args__ = (
+        CheckConstraint(
+            "new_temperature IS NOT NULL AND expected_version >= 0 "
+            "AND version >= 1",
+            name="chk_correction_shape",
+        ),
+        CheckConstraint(
+            "(target_type = 'own_event' AND target_event_id IS NOT NULL "
+            "AND target_reading_id IS NULL AND trip_id IS NULL) "
+            "OR (target_type = 'vehicle_reading' "
+            "AND target_reading_id IS NOT NULL AND trip_id IS NOT NULL "
+            "AND target_event_id IS NULL AND cargo_id IS NULL)",
+            name="chk_correction_target",
+        ),
+        # 每个目标下版本号唯一（应用侧在持锁期间按序号分配）
+        Index(
+            "ux_correction_event_version",
+            "target_event_id",
+            "version",
+            unique=True,
+        ),
+        Index(
+            "ux_correction_reading_version",
+            "target_reading_id",
+            "version",
+            unique=True,
+        ),
+        Index(
+            "ix_correction_event",
+            "target_event_id",
+            "created_at",
+            "correction_id",
+        ),
+        Index(
+            "ix_correction_reading",
+            "target_reading_id",
+            "created_at",
+            "correction_id",
+        ),
+    )
+
+    correction_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_type: Mapped[CorrectionTarget] = mapped_column(
+        Enum(CorrectionTarget, name="correction_target", create_constraint=True),
+        nullable=False,
+    )
+    # own_event 目标坐标（target_type='own_event' 时有值）
+    cargo_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # vehicle_reading 目标坐标（target_type='vehicle_reading' 时有值）
+    target_reading_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trip_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    new_temperature: Mapped[Decimal] = mapped_column(
+        Numeric(10, 3), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

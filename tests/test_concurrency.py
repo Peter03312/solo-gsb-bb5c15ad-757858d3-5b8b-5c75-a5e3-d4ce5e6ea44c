@@ -174,3 +174,131 @@ def test_concurrent_vehicle_reading_and_own_measurement_serialize(client):
     tl = client.get("/cargo/CV/timeline").json()["points"]
     veh = [p for p in tl if p["source"] == "vehicle"]
     assert len(veh) == 1 and veh[0]["adopted"] is False
+
+
+def test_concurrent_vehicle_correction_and_own_measurement_serialize(client):
+    """车载读数更正与受影响货物的自有测温写入共用货物行锁，必须串行。
+
+    读数时刻 11:00 并发：一笔把车载读数从 9℃ 更正为 2℃（version 0），
+    多笔同刻自有测温写入（只允许一笔成功）。无论交叠顺序如何，最终视图确定：
+    * 更正恰好成功一次（201），重复更正按幂等/冲突处理；
+    * 同刻自有测温优先：货物不越温；车次详情对该货物 adopted=false；
+    * 原始读数仍为 9℃，有效温度为 2℃、版本 1。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CCR",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TVR", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TVR/manifest",
+        json={"items": [{
+            "cargo_id": "CCR",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+    assert client.post(
+        "/vehicle-readings",
+        json={
+            "reading_id": "vr1",
+            "trip_id": "TVR",
+            "read_at": "2026-01-01T11:00:00+00:00",
+            "temperature": "9",
+        },
+    ).status_code == 201
+
+    def submit_correction(i):
+        return client.post(
+            "/corrections",
+            json={
+                "correction_id": "vc-same" if i == 0 else f"vc-other{i}",
+                "target_type": "vehicle_reading",
+                "target_id": "vr1",
+                # 只允许一笔以 version 0 成功；其余同编号幂等或版本过期
+                "expected_version": 0,
+                "new_temperature": "2",
+            },
+        ).status_code
+
+    def submit_own(i):
+        return client.post(
+            "/events",
+            json={
+                "event_id": "m-own" if i == 0 else f"m-own-x{i}",
+                "cargo_id": "CCR",
+                "occurred_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "3",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        corr_codes = list(pool.map(submit_correction, range(4)))
+        own_codes = list(pool.map(submit_own, range(4)))
+
+    # 自有测温只成功一笔
+    assert own_codes.count(201) == 1
+    # 更正：成功(201)/幂等(200) 合计 4 次提交中“vc-same”相关至少有一条 201，
+    # 其余编号因版本过期 409；不得有 5xx
+    assert 201 in corr_codes
+    assert all(c in (200, 201, 409) for c in corr_codes)
+
+    assert client.get("/cargo/CCR/report").json()["excursions"] == []
+    reading = client.get("/trips/TVR").json()["readings"][0]
+    assert reading["temperature"] == "9.000"
+    assert reading["effective_temperature"] == "2.000"
+    assert reading["version"] == 1
+    app_ccr = next(a for a in reading["applications"] if a["cargo_id"] == "CCR")
+    assert app_ccr["adopted"] is False
+
+
+def test_concurrent_own_event_correction_and_event_write_serialize(client):
+    """自有测温更正与同货物事件写入共用货物行锁：版本判定与重建视图确定。"""
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "COC",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    client.post(
+        "/events",
+        json={
+            "event_id": "m1",
+            "cargo_id": "COC",
+            "occurred_at": "2026-01-01T10:10:00+00:00",
+            "temperature": "9",
+        },
+    )
+
+    def submit(i):
+        # 同编号同内容更正并发：一笔 201，其余 200 幂等
+        return client.post(
+            "/corrections",
+            json={
+                "correction_id": "c-same",
+                "target_type": "own_event",
+                "target_id": "m1",
+                "expected_version": 0,
+                "new_temperature": "3",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit, range(8)))
+
+    assert codes.count(201) == 1
+    assert codes.count(200) == 7
+    hist = client.get("/events/m1/corrections").json()
+    assert len(hist["corrections"]) == 1
+    assert hist["version"] == 1
+    assert client.get("/cargo/COC/report").json()["excursions"] == []

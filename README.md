@@ -4,6 +4,8 @@
 
 车载测温（本轮）：同一冷链车承载多票货物时，可登记车次、每票货物的装卸时段（左闭右开）与车载探头读数；车载读数仅作用于读数时刻仍在车上的货物，并按**各自温度上限**判断越温；同刻有货物自有测温时**优先采用自有值**（车载原始读数仍可查）；交接仍只由货物自有事件改变保管方。质控接口 `GET /trips/{trip_id}/simultaneous-excursions` 按带时区查询窗返回同一车次上**多票货物同时越温**的时段（数量门槛 `min_cargo≥2`，货物集合变化即分段）。
 
+测温值更正（本轮）：测温录错后，可凭**自有测温事件ID 或车载读数ID**（配合 `target_type` 与 `target_id`）、**更正ID**、**期望版本** `expected_version` 与**新温度**提交更正。更正**只改温度**——测温时刻、货物 / 车次归属与原始编号均不变，**交接不可更正**。原始测温 / 读数永不修改，更正只追加（append-only）；原始记录查询的 `temperature` 仍是原值，另显示 `effective_temperature` 与 `version`（0=原始，n=第 n 次更正后的有效值），原始记录及历次更正均可查。货物时间线、越温报告、责任确认与车次同时越温查询一律**按有效值重建**；同刻自有测温优先与装卸时段左闭右开规则继续适用；车载读数更正**同时影响读数时刻在车的全部货物**。原事件 / 原读数按原内容重传仍幂等；更正ID同内容重传返回原结果、异内容冲突；期望版本过期、目标不存在或目标为交接均拒绝且不落部分结果。更正与相关事件、责任表态及装卸登记经行锁串行；历史表态保留，其当前有效性按重建后的责任片段判断。
+
 ## 一、一键启动（Docker Compose，含数据库初始化）
 
 ```bash
@@ -76,6 +78,9 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/trips/{trip_id}/manifest` | 批量登记车次上各票货物的装卸时段（原子） |
 | `POST` | `/vehicle-readings` | 写入车载测温读数（允许晚到；幂等 / 冲突） |
 | `GET` | `/trips/{trip_id}/simultaneous-excursions` | **质控：同一车次多票货物同时越温时段** |
+| `POST` | `/corrections` | **提交测温值更正**（只改温度；自有测温 / 车载读数） |
+| `GET` | `/events/{event_id}/corrections` | 自有事件的原始测温与**历次更正**（交接为空历史） |
+| `GET` | `/vehicle-readings/{reading_id}/corrections` | 车载读数的原始温度与**历次更正** |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建货物 `POST /cargo`
@@ -173,13 +178,15 @@ uvicorn app.main:app --reload --port 8000
 
 ### 2.4 车次详情 `GET /trips/{trip_id}`
 
-返回车次信息、全部装卸时段，以及车载原始读数；每笔读数对车次上**每票已登记货物**给出：
+返回车次信息、全部装卸时段，以及车载原始读数；每笔读数除原始 `temperature` 外另给
+`effective_temperature` / `version`（更正后的当前有效温度与版本），并对车次上**每票
+已登记货物**给出：
 
 | 字段 | 含义 |
 | --- | --- |
 | `on_board` | 读数时刻该货物是否仍在车上（左闭右开边界） |
 | `adopted` | 是否被该货物越温时间线**采用**（在车上且同刻无自有测温） |
-| `over_limit` | 按**该货物自身温度上限**判断是否越温；不在车上时为 `null` |
+| `over_limit` | 按**该货物自身温度上限**与读数的**当前有效温度**判断是否越温；不在车上时为 `null` |
 | `reason` | `adopted` 已采用 / `not_on_board` 不在车上 / `supplanted_by_own` 同刻有自有测温被取代 |
 
 ### 2.5 货物读数时间线 `GET /cargo/{cargo_id}/timeline`
@@ -187,7 +194,9 @@ uvicorn app.main:app --reload --port 8000
 返回该货物的**合并读数时间线**（按时间）：货物自有测温 / 交接，以及对其适用的车载原始读数。
 每个点带 `source`（`own` / `vehicle`）、`event_id` / `reading_id` / `trip_id`、
 `adopted`（车载点同刻被自有测温取代时为 `false`，原始读数仍列出）、
-`changes_holder`（仅自有交接为 `true`——车载读数不改变保管方）。
+`changes_holder`（仅自有交接为 `true`——车载读数不改变保管方）、
+`temperature`（测温点为**当前有效温度**，已含更正）与 `version`（有效温度的更正版本，
+0=原始值）。
 
 ### 2.6 质控：同时越温时段 `GET /trips/{trip_id}/simultaneous-excursions`
 
@@ -237,6 +246,113 @@ curl -G "http://localhost:8000/trips/TRUCK-1/simultaneous-excursions" \
 ```
 
 无任何达门槛片段时返回 `200` 且 `segments` 为空数组。响应时间统一为 UTC（`Z`）。
+
+### 2.7 测温值更正 `POST /corrections`
+
+测温录错后提交**只改温度**的更正；测温时刻、货物 / 车次归属与原始编号不变，**交接不可更正**。目标由 `target_type` + `target_id` 指定：
+
+* `target_type="own_event"`、`target_id=`自有**测温事件ID**；
+* `target_type="vehicle_reading"`、`target_id=`**车载读数ID**。
+
+```json
+{
+  "correction_id": "corr-1",
+  "target_type": "own_event",
+  "target_id": "evt-temp-1",
+  "expected_version": 0,
+  "new_temperature": "3.8"
+}
+```
+
+* `correction_id`：客户端指定的更正编号；
+* `expected_version`：提交时目标的**当前更正版本**（首次更正为 `0`，之后取上一次更正回执 / 历史查询中的 `version`）——乐观锁，不一致即拒绝；
+* `new_temperature`：更正后的新温度（℃）。时间不在更正范围内，故无时间字段。
+
+回执（`201`）给出更正记录、更正后的**有效温度与版本**，以及受影响货物：
+
+```json
+{
+  "correction": {
+    "correction_id": "corr-1",
+    "target_type": "own_event",
+    "target_id": "evt-temp-1",
+    "cargo_id": "COLD-001",
+    "trip_id": null,
+    "expected_version": 0,
+    "version": 1,
+    "new_temperature": "3.800",
+    "created_at": "2026-10-02T03:00:00Z"
+  },
+  "effective_temperature": "3.800",
+  "version": 1,
+  "affected_cargo_ids": ["COLD-001"]
+}
+```
+
+处理规则：
+
+* 更正**只改温度**：原测温 / 原读数行永不修改，更正只追加；每个目标维护单调版本，
+  更正后的版本 = `expected_version + 1`；当前有效温度取该目标**最新一条**更正；
+* **自有测温更正**：`affected_cargo_ids` 恒为该测温所属货物；
+* **车载读数更正**：`correction.trip_id` 给出车次，`affected_cargo_ids` 为**读数时刻
+  仍在车上的全部货物**（左闭右开 `loaded_at ≤ read_at < unloaded_at`，可能为空），
+  各货物仍按**各自温度上限**重建越温；
+* **同刻自有测温优先**继续适用：该时刻存在自有测温的货物，车载读数（即使已更正）
+  仍标记被取代、不参与其重建；**装卸时段左闭右开**继续适用；
+* 货物时间线、越温报告（含读数来源与 `veh:<读数ID>` 区间标识）、责任确认与
+  车次同时越温查询全部**按有效温度重建**；区间标识仍由开启读数的原编号决定
+  （自有=事件ID、车载=`veh:<读数ID>`），不因更正换号；
+* **历史表态保留**：更正重建后，区间消失 / 重新开放 / 片段变化使旧表态失效，
+  片段未变化的表态继续有效（表态历史中的 `is_current` 按重建结果重新判定）；
+* **幂等与冲突**：
+  - 原事件 / 原读数按**原内容**重传仍幂等（`temperature` 按原始录入值比对，不看更正值）；
+  - `correction_id` **同内容**（目标类型、目标编号、期望版本、新温度全相同）重传
+    返回 `200 {"replayed": true, …原结果…}`；**异内容** `409 correction_id_conflict`；
+  - `expected_version` 与当前版本不一致 → `409 stale_version`；
+  - 目标不存在：自有事件 `404 event_not_found`、车载读数 `404 reading_not_found`；
+  - 目标是交接 → `422 handover_not_correctable`；`target_type` 非法 / 期望版本为负
+    → `422 bad_correction_shape`；
+  - 以上失败**一律不写任何部分结果**。
+* **串行**：更正与相关写入在单事务内加锁串行——自有更正锁所属货物行；车载更正
+  **先按 cargo_id 升序锁定读数时刻在车的全部货物行、再锁定车次行**（与车载读数
+  写入同一锁顺序），故更正与这些货物的事件写入、责任表态、车次装卸登记 / 读数
+  写入严格串行，版本校验所见必为持锁期间的最新有效温度。
+
+### 2.8 原始记录与历次更正查询
+
+* `GET /events/{event_id}/corrections`：返回该自有事件的原始测温（`original_temperature`）、
+  当前 `effective_temperature` / `version` 与历次更正（按版本升序，append-only）；
+  目标为**交接**时也可查：`version=0`、温度字段为 `null`、`corrections` 为空；
+  事件不存在 → `404 event_not_found`。
+* `GET /vehicle-readings/{reading_id}/corrections`：车载读数的原始温度与历次更正，
+  结构同上；读数不存在 → `404 reading_not_found`。
+
+```json
+{
+  "target_type": "own_event",
+  "target_id": "evt-temp-1",
+  "target_exists": true,
+  "original_temperature": "8.200",
+  "effective_temperature": "3.800",
+  "version": 1,
+  "corrections": [
+    { "correction_id": "corr-1", "target_type": "own_event",
+      "target_id": "evt-temp-1", "cargo_id": "COLD-001", "trip_id": null,
+      "expected_version": 0, "version": 1,
+      "new_temperature": "3.800", "created_at": "…",
+      "original_temperature": "8.200" }
+  ]
+}
+```
+
+此外，原始记录列表 / 详情也直接携带有效值：
+
+* `GET /cargo/{cargo_id}/events` 中每条测温事件除原始 `temperature` 外，另给
+  `effective_temperature` 与 `version`（交接二者为 `null` / `0`）；
+* 车次详情 `GET /trips/{trip_id}` 的每笔车载读数除原始 `temperature` 外，另给
+  `effective_temperature` 与 `version`；`over_limit` 等适用性按有效温度判定；
+* 货物合并时间线 `GET /cargo/{cargo_id}/timeline` 的测温点 `temperature` 为
+  **当前有效温度**（含更正），并带 `version`（被取代的车载点也携带，仅供查阅）。
 
 ### 3. 追责报告 `GET /cargo/{cargo_id}/report`
 
@@ -374,15 +490,22 @@ curl -G "http://localhost:8000/trips/TRUCK-1/simultaneous-excursions" \
 13. **车载读数晚到与幂等**：读数允许乱序写入，写入后对全部受影响货物的时间线按时刻整体重建；`reading_id` 同内容重传幂等、异内容冲突；同车次同刻至多一笔读数。
 14. **串行一致性**：车载读数写入在单事务内**先按 cargo_id 升序锁定全部受影响货物行、再锁定车次行**，与这些货物的自有事件写入、责任表态严格串行（与装卸登记、同车次读数写入也经车次行锁串行），校验与重建所见必为持锁期间的最新时间线。
 15. **同时越温质控查询**：对车次上每票货物按其合并时间线重建越温区间（规则 11–13 同样适用），先与该车次装卸时段相交（装车前 / 卸货后不计，左闭右开），再与左闭右开查询窗相交；未闭合区间先后被卸货时刻与查询终点截断。货物集合变化即分段，相邻同集合片段合并，仅保留达 `min_cargo`（≥2）门槛的正长度片段。查询只读、不加写锁：PostgreSQL 下以 REPEATABLE READ 快照事务保证同次查询视图一致，晚到读数 / 事件须提交后才会被后续查询看到。
+16. **测温值更正**：
+    - 更正**只改温度**：凭目标（自有测温事件ID / 车载读数ID + `target_type`）、更正ID、期望版本与新温度提交；测温时刻、货物 / 车次归属与原编号不变，交接不可更正；
+    - 原始测温 / 读数永不修改，更正只追加；每目标版本单调递增（首次更正后版本 1，新有效温度 = 最新更正的 `new_temperature`；无更正时有效温度 = 原始温度、版本 0）；
+    - 原始记录查询的 `temperature` 恒为原值，另显示 `effective_temperature` / `version`；原始记录及历次更正可查；货物时间线、越温报告、责任确认及车次同时越温查询全部按有效值重建，区间稳定标识仍用原编号（事件ID / `veh:<读数ID>`）；
+    - 同刻自有测温优先、装卸时段左闭右开规则在更正后继续适用；车载读数更正同时影响读数时刻在车的全部货物（按各自上限），同刻有自有测温被取代的货物不受其取值影响；
+    - 原事件 / 读数按原内容重传仍幂等；更正ID同内容（目标 + 期望版本 + 新温度）重传返回原结果、异内容 `correction_id_conflict`；期望版本过期 `stale_version`、目标不存在（`event_not_found` / `reading_not_found`）、目标为交接（`handover_not_correctable`）均拒绝且不落部分结果；
+    - 更正与相关事件、表态及装卸登记串行：自有更正锁货物行，车载更正先按 cargo_id 升序锁在车货物行再锁车次行；历史表态保留，其当前有效性按重建后的责任片段逐片段判断（区间消失 / 开放 / 片段变化即失效，未变化片段继续有效）。
 
 错误响应统一格式：`{"error": {"code": "...", "message": "..."}}`。
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` | 货物、已闭合区间或车次不存在 |
-| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` | 编号或同刻冲突、表态编号冲突、快照过期、装卸跨车次重叠 |
-| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `reserved_event_id` / `invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter` | 业务校验失败（整体拒绝、不落库）；后四项为同时越温查询参数错误 |
-| 200 | 响应体 `replayed=true` | 事件 / 表态 / 车载读数同 ID 同内容幂等重传 |
+| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` / `event_not_found` / `reading_not_found` | 货物、已闭合区间、车次、更正目标事件或车载读数不存在 |
+| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` / `correction_id_conflict` / `stale_version` | 编号或同刻冲突、表态编号冲突、快照过期、装卸跨车次重叠、更正编号异内容冲突、更正期望版本过期 |
+| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `reserved_event_id` / `invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter` / `handover_not_correctable` / `bad_correction_shape` | 业务校验失败（整体拒绝、不落库）；`handover_not_correctable`=交接不可更正，`bad_correction_shape`=更正目标类型非法 / 期望版本为负；其余见各项 |
+| 200 | 响应体 `replayed=true` | 事件 / 表态 / 车载读数 / 测温更正同 ID 同内容幂等重传 |
 
 ## 六、调用示例
 
@@ -401,12 +524,12 @@ python examples/python_client.py
 ```bash
 pip install pytest httpx
 
-pytest -q                                          # 100 个用例（内存库），并发用例自动跳过
+pytest -q                                          # 119 个用例（内存库），并发用例自动跳过
 DATABASE_URL="sqlite:////tmp/cc.db" \
-  pytest tests/test_concurrency.py -q              # 3 个并发串行化用例（事件 / 表态 / 车载读数，需文件型库）
+  pytest tests/test_concurrency.py -q              # 5 个并发串行化用例（事件 / 表态 / 车载读数 / 车载更正 / 自有更正，需文件型库）
 ```
 
-测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化；以及本轮质控同时越温查询的集合变化分段、相邻同集合合并、门槛过滤、查询窗与装卸时段裁剪（左闭右开）、未闭合区间裁至查询终点、装车前带入的开放区间自装车时刻起算、同刻自有优先、晚到读数后查询反映新结果、空结果与参数 / 未知车次错误。
+测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化；质控同时越温查询的集合变化分段、相邻同集合合并、门槛过滤、查询窗与装卸时段裁剪（左闭右开）、未闭合区间裁至查询终点、装车前带入的开放区间自装车时刻起算、同刻自有优先、晚到读数后查询反映新结果、空结果与参数 / 未知车次错误；以及本轮测温值更正的只改温度（时间 / 归属 / 原编号不变）、版本递增与乐观锁、原始记录保留原值另显示有效温度与版本、历次更正可查、自有 / 车载更正后报告 / 时间线 / 责任确认 / 同时越温按有效值重建、车载更正同时影响在车全部货物、同刻自有优先与左闭右开继续适用、交接不可更正、更正与原记录幂等重传 / 异内容冲突 / 版本过期 / 目标缺失拒绝且不落部分结果、更正后历史表态按重建片段判定有效性、车载 / 自有更正并发串行化。
 
 ## 八、目录结构
 
@@ -415,19 +538,20 @@ DATABASE_URL="sqlite:////tmp/cc.db" \
 ├── app/
 │   ├── main.py            # FastAPI 路由与异常映射
 │   ├── crud.py            # 自有事件写入事务、幂等、整链校验
+│   ├── correction_crud.py # 测温值更正事务（货物行锁 / 在车货物行锁→车次行锁、版本与幂等）
 │   ├── vehicle_crud.py    # 车次 / 装卸时段 / 车载读数写入事务（货物行锁→车次行锁）
 │   ├── stance_crud.py     # 责任表态写入事务（与事件 / 读数共用货物行锁）
-│   ├── timeline.py        # 合并读数时间线（自有事件 + 适用车载读数，同刻自有优先）
+│   ├── timeline.py        # 合并读数时间线（自有事件 + 适用车载读数，同刻自有优先，含更正有效值）
 │   ├── overlap.py         # 质控同时越温：越温区间 × 装卸时段 × 查询窗求交 + 扫描线分段（纯函数）
 │   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数，含 veh: 区间标识）
 │   ├── responsibility.py  # 快照标识、表态有效性、确认汇总（纯逻辑）
-│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸 / 车载读数 / 表态）
+│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸 / 车载读数 / 表态 / 更正）
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # 引擎、Session（含 SQLite 兼容）
 │   └── timeutil.py        # UTC 归一化
 ├── db/init.sql            # PostgreSQL 初始化（枚举、表、约束、索引）
-├── examples/              # curl / Python 调用示例（含车次、车载测温与同时越温查询完整链路）
-├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 同时越温 + 并发测试
+├── examples/              # curl / Python 调用示例（含车次、车载测温、同时越温查询与测温更正完整链路）
+├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 同时越温 + 测温更正 + 并发测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
