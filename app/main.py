@@ -14,7 +14,9 @@ from sqlalchemy.orm import Session
 
 from app import (
     chain,
+    correction_crud,
     crud,
+    effective,
     responsibility,
     stance_crud,
     timeline,
@@ -27,6 +29,7 @@ from app.models import (
     Loading,
     Stance,
     StanceKind,
+    TemperatureCorrection,
     Trip,
     VehicleReading,
 )
@@ -53,6 +56,11 @@ from app.schemas import (
     StanceOut,
     StanceReplay,
     StanceSegment,
+    TemperatureCorrectionAck,
+    TemperatureCorrectionCreate,
+    TemperatureCorrectionHistory,
+    TemperatureCorrectionOut,
+    TemperatureCorrectionReplay,
     TimelinePointOut,
     TripCreate,
     TripDetail,
@@ -81,7 +89,7 @@ app = FastAPI(
         "记录冷链货物的自有测温与交接事件、车次装卸时段与车载测温读数，"
         "在合并读数时间线上按发生时间重建保管链，计算越温区间并拆分各保管方责任。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -119,6 +127,30 @@ def get_cargo(cargo_id: str, db: Session = Depends(get_db)) -> Cargo:
 # ---------------------------------------------------------------- 事件
 
 
+def _event_out(e: Event, eff: effective.EffectiveTemperatures | None = None) -> EventOut:
+    """事件响应：测温事件附当前有效温度与版本（交接为 null / 0）。"""
+    raw_temp = Decimal(e.temperature) if e.temperature is not None else None
+    if e.event_type.name == "measurement" and raw_temp is not None:
+        eff_temp, version = (
+            eff.own_temperature(e.event_id, raw_temp)
+            if eff is not None
+            else (raw_temp, 0)
+        )
+    else:
+        eff_temp, version = None, 0
+    return EventOut(
+        event_id=e.event_id,
+        cargo_id=e.cargo_id,
+        event_type=e.event_type,
+        occurred_at=e.occurred_at,
+        temperature=raw_temp,
+        giver=e.giver,
+        receiver=e.receiver,
+        effective_temperature=eff_temp,
+        temperature_version=version,
+    )
+
+
 @app.post(
     "/events",
     response_model=EventOut,
@@ -142,7 +174,8 @@ def create_event(payload: EventCreate, db: Session = Depends(get_db)):
                 message="相同内容的事件已存在，重传被忽略（幂等）",
             ).model_dump(),
         )
-    return result.event
+    # 新写入的事件尚无更正：有效温度即原始温度，版本 0
+    return _event_out(result.event)
 
 
 @app.get(
@@ -150,8 +183,13 @@ def create_event(payload: EventCreate, db: Session = Depends(get_db)):
     response_model=list[EventOut],
     tags=["货物自有事件"],
 )
-def list_events(cargo_id: str, db: Session = Depends(get_db)) -> list[Event]:
-    """只列货物**自有**事件（测温 / 交接）；车载读数不在此列表，经车次/读数时间线查询。"""
+def list_events(cargo_id: str, db: Session = Depends(get_db)) -> list[EventOut]:
+    """只列货物**自有**事件（测温 / 交接）；车载读数不在此列表，经车次/读数时间线查询。
+
+    测温事件的 ``temperature`` 恒为**原始录入值**（更正不改原始记录），另给
+    ``effective_temperature``（当前有效温度）与 ``temperature_version``
+    （0=未更正，>0=已更正到第 N 版）。
+    """
     if db.get(Cargo, cargo_id) is None:
         raise crud.ApiError(404, "cargo_not_found", f"货物 {cargo_id} 不存在")
     stmt = (
@@ -162,7 +200,13 @@ def list_events(cargo_id: str, db: Session = Depends(get_db)) -> list[Event]:
     events = list(db.scalars(stmt).all())
     for e in events:
         e.occurred_at = ensure_utc(e.occurred_at)
-    return events
+    eff = effective.load_target_corrections(
+        db,
+        event_ids=[
+            e.event_id for e in events if e.event_type.name == "measurement"
+        ],
+    )
+    return [_event_out(e, eff) for e in events]
 
 
 # ---------------------------------------------------------------- 车次 / 装卸 / 车载读数
@@ -178,12 +222,21 @@ def list_trips(db: Session = Depends(get_db)) -> list[Trip]:
     return vehicle_crud.list_trips(db)
 
 
-def _reading_out(r: VehicleReading) -> VehicleReadingOut:
+def _reading_out(
+    r: VehicleReading, eff: effective.EffectiveTemperatures | None = None
+) -> VehicleReadingOut:
+    eff_temp, version = (
+        eff.vehicle_temperature(r.reading_id, Decimal(r.temperature))
+        if eff is not None
+        else (Decimal(r.temperature), 0)
+    )
     return VehicleReadingOut(
         reading_id=r.reading_id,
         trip_id=r.trip_id,
         read_at=ensure_utc(r.read_at),
         temperature=Decimal(r.temperature),
+        effective_temperature=eff_temp,
+        temperature_version=version,
         created_at=ensure_utc(r.created_at),
     )
 
@@ -239,7 +292,8 @@ def create_vehicle_reading(
     """
     payload.read_at = ensure_utc(payload.read_at)
     result = vehicle_crud.create_vehicle_reading(db, payload)
-    reading_out = _reading_out(result.reading)
+    eff = effective.load_target_corrections(db, reading_ids=[result.reading.reading_id])
+    reading_out = _reading_out(result.reading, eff)
     if result.replayed:
         return JSONResponse(
             status_code=200,
@@ -252,6 +306,163 @@ def create_vehicle_reading(
         )
     return VehicleReadingAck(
         reading=reading_out, affected_cargo_ids=result.affected_cargo_ids
+    )
+
+
+# ---------------------------------------------------------------- 测温值更正
+
+
+def _correction_out(c: TemperatureCorrection) -> TemperatureCorrectionOut:
+    return TemperatureCorrectionOut(
+        correction_id=c.correction_id,
+        target_type=(
+            c.target_type.value
+            if hasattr(c.target_type, "value")
+            else str(c.target_type)
+        ),
+        event_id=c.event_id,
+        reading_id=c.reading_id,
+        cargo_id=c.cargo_id,
+        expected_version=c.expected_version,
+        version=c.version,
+        new_temperature=Decimal(c.new_temperature),
+        created_at=ensure_utc(c.created_at),
+    )
+
+
+def _correction_out_dict(c: TemperatureCorrection) -> dict:
+    """供 JSONResponse 使用：Decimal 序列化为三位小数字符串。"""
+    data = _correction_out(c).model_dump(mode="json")
+    data["new_temperature"] = str(Decimal(c.new_temperature).quantize(Decimal("0.001")))
+    return data
+
+
+def _correction_ack_dict(result) -> dict:
+    """组装更正回执内容（Decimal 统一为三位小数字符串，与其余响应一致）。"""
+    return {
+        "correction": _correction_out_dict(result.correction),
+        "target_type": result.target_type,
+        "target_id": result.target_id,
+        "cargo_id": result.cargo_id,
+        "effective_temperature": str(result.effective_temperature.quantize(Decimal("0.001"))),
+        "temperature_version": result.version,
+        "affected_cargo_ids": result.affected_cargo_ids,
+    }
+
+
+@app.post(
+    "/temperature-corrections",
+    response_model=TemperatureCorrectionAck,
+    status_code=201,
+    tags=["测温更正"],
+    responses={
+        200: {
+            "model": TemperatureCorrectionReplay,
+            "description": "同更正ID同内容重传：返回原结果（幂等）",
+        },
+        404: {"description": "目标自有事件 / 车载读数不存在"},
+        409: {"description": "更正ID异内容冲突 / 预期版本过期"},
+        422: {"description": "目标是交接不可更正 / 请求目标形状非法"},
+    },
+)
+def submit_temperature_correction(
+    payload: TemperatureCorrectionCreate, db: Session = Depends(get_db)
+):
+    """更正一笔测温值（自有测温事件 或 车载读数，二选一定位目标）。
+
+    只改温度：测温时刻、货物归属与原编号不变，交接事件不可更正。每次更正生成
+    新版本；货物时间线、越温报告、责任确认与车次同时越温查询一律按最新有效
+    温度重建。车载读数更正同时影响读数时刻仍在该车次车上的全部货物。
+
+    更正与相关事件、责任表态、车载读数及装卸登记在同一套行锁下串行；
+    预期版本与服务端当前版本不一致（版本过期）、目标不存在或目标为交接，
+    一律拒绝且不落任何部分结果。
+    """
+    result = correction_crud.submit_correction(db, payload)
+    if result.replayed:
+        content = _correction_ack_dict(result)
+        content["replayed"] = True
+        content["message"] = "相同内容的测温更正已存在，重传返回原结果（幂等）"
+        return JSONResponse(status_code=200, content=content)
+    return JSONResponse(status_code=201, content=_correction_ack_dict(result))
+
+
+@app.get(
+    "/temperature-corrections/{correction_id}",
+    response_model=TemperatureCorrectionOut,
+    tags=["测温更正"],
+    responses={404: {"description": "更正不存在"}},
+)
+def get_temperature_correction(
+    correction_id: str, db: Session = Depends(get_db)
+) -> TemperatureCorrectionOut:
+    """按更正ID查询单条更正记录（原始测温记录及历次更正均保留可查）。"""
+    return _correction_out(correction_crud.get_correction(db, correction_id))
+
+
+@app.get(
+    "/events/{event_id}/corrections",
+    response_model=TemperatureCorrectionHistory,
+    tags=["测温更正"],
+    responses={404: {"description": "自有事件不存在"}},
+)
+def event_correction_history(
+    event_id: str, db: Session = Depends(get_db)
+) -> TemperatureCorrectionHistory:
+    """查询某自有测温事件的原始温度与历次更正（按版本升序），并给出当前有效温度。"""
+    event = db.get(Event, event_id)
+    if event is None:
+        raise crud.ApiError(404, "event_not_found", f"自有事件 {event_id} 不存在")
+    if event.event_type.name != "measurement":
+        raise crud.ApiError(
+            422,
+            "target_not_correctable",
+            f"事件 {event_id} 是交接事件，交接不记录温度、不可更正，无更正历史",
+        )
+    rows = effective.list_corrections(db, correction_crud.TARGET_OWN, event_id)
+    eff = effective.load_target_corrections(db, event_ids=[event_id])
+    eff_temp, version = eff.own_temperature(event_id, Decimal(event.temperature))
+    return TemperatureCorrectionHistory(
+        target_type=correction_crud.TARGET_OWN,
+        target_id=event_id,
+        cargo_id=event.cargo_id,
+        trip_id=None,
+        target_at=ensure_utc(event.occurred_at),
+        original_temperature=Decimal(event.temperature),
+        current_version=version,
+        effective_temperature=eff_temp,
+        corrections=[_correction_out(c) for c in rows],
+    )
+
+
+@app.get(
+    "/vehicle-readings/{reading_id}/corrections",
+    response_model=TemperatureCorrectionHistory,
+    tags=["测温更正"],
+    responses={404: {"description": "车载读数不存在"}},
+)
+def reading_correction_history(
+    reading_id: str, db: Session = Depends(get_db)
+) -> TemperatureCorrectionHistory:
+    """查询某车载读数的原始温度与历次更正（按版本升序），并给出当前有效温度。"""
+    reading = db.get(VehicleReading, reading_id)
+    if reading is None:
+        raise crud.ApiError(
+            404, "reading_not_found", f"车载读数 {reading_id} 不存在"
+        )
+    rows = effective.list_corrections(db, correction_crud.TARGET_VEHICLE, reading_id)
+    eff = effective.load_target_corrections(db, reading_ids=[reading_id])
+    eff_temp, version = eff.vehicle_temperature(reading_id, Decimal(reading.temperature))
+    return TemperatureCorrectionHistory(
+        target_type=correction_crud.TARGET_VEHICLE,
+        target_id=reading_id,
+        cargo_id=None,
+        trip_id=reading.trip_id,
+        target_at=ensure_utc(reading.read_at),
+        original_temperature=Decimal(reading.temperature),
+        current_version=version,
+        effective_temperature=eff_temp,
+        corrections=[_correction_out(c) for c in rows],
     )
 
 
@@ -276,15 +487,15 @@ def _excursion_schema(ex) -> Excursion:
     )
 
 
-def _trip_reading_application(db, reading: VehicleReading, loadings, cargos):
-    """一笔车载读数对车次上各票货物的适用性/采用情况。"""
+def _trip_reading_application(db, reading: VehicleReading, loadings, cargos, eff):
+    """一笔车载读数对车次上各票货物的适用性/采用情况（温度均取有效温度）。"""
     apps = []
     read_at = ensure_utc(reading.read_at)
     cargo_loadings: dict[str, list] = {}
     for l in loadings:
         cargo_loadings.setdefault(l.cargo_id, []).append(l)
 
-    own_at: dict[str, bool] = {}
+    own_at: dict[str, Event] = {}
     if cargo_loadings:
         rows = db.scalars(
             select(Event).where(
@@ -292,29 +503,43 @@ def _trip_reading_application(db, reading: VehicleReading, loadings, cargos):
                 Event.occurred_at == read_at,
             )
         ).all()
-        own_at = {
-            e.cargo_id: True
-            for e in rows
-            if e.event_type.name == "measurement"
-        }
+        for e in rows:
+            if e.event_type.name == "measurement":
+                own_at[e.cargo_id] = e
+
+    read_eff_temp, read_version = eff.vehicle_temperature(
+        reading.reading_id, Decimal(reading.temperature)
+    )
 
     for cargo_id in sorted(cargo_loadings):
         on_board = any(timeline.is_on_board(l, read_at) for l in cargo_loadings[cargo_id])
-        adopted = bool(on_board and not own_at.get(cargo_id))
+        own_event = own_at.get(cargo_id)
+        adopted = bool(on_board and own_event is None)
         over = None
+        applied_temp = None
         reason = "adopted"
         if not on_board:
             reason = "not_on_board"
-        elif own_at.get(cargo_id):
+        elif own_event is not None:
             reason = "supplanted_by_own"
+            # 同刻自有测温优先：采用该自有测温的有效温度
+            own_temp, _ = eff.own_temperature(
+                own_event.event_id, Decimal(own_event.temperature)
+            )
+            applied_temp = own_temp
         if on_board:
-            over = Decimal(reading.temperature) > Decimal(cargos[cargo_id].temp_upper_limit)
+            if applied_temp is None:
+                applied_temp = read_eff_temp
+            over = applied_temp > Decimal(cargos[cargo_id].temp_upper_limit)
         apps.append(
             ReadingApplication(
                 cargo_id=cargo_id,
                 on_board=on_board,
                 adopted=adopted,
                 over_limit=over,
+                applied_temperature=applied_temp,
+                reading_temperature=read_eff_temp,
+                reading_temperature_version=read_version,
                 reason=reason,
             )
         )
@@ -334,27 +559,50 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
         l.loaded_at = ensure_utc(l.loaded_at)
         l.unloaded_at = ensure_utc(l.unloaded_at)
     readings = vehicle_crud.get_readings(db, trip_id)
+    cargo_ids = sorted({l.cargo_id for l in loadings})
+    read_ats = {ensure_utc(r.read_at) for r in readings}
+    # 仅取“车次上各票货物 × 各读数时刻”的自有测温（用于同刻自有优先判定），
+    # 连同全部读数的更正一起折叠为有效温度覆盖
+    own_at_reading_rows = []
+    if cargo_ids and read_ats:
+        own_at_reading_rows = list(
+            db.scalars(
+                select(Event).where(
+                    Event.cargo_id.in_(cargo_ids),
+                    Event.occurred_at.in_(read_ats),
+                )
+            ).all()
+        )
+    eff = effective.load_target_corrections(
+        db,
+        reading_ids=[r.reading_id for r in readings],
+        event_ids=[
+            e.event_id
+            for e in own_at_reading_rows
+            if e.event_type.name == "measurement"
+        ],
+    )
 
     cargos = {
         c.cargo_id: c
         for c in db.scalars(
-            select(Cargo).where(
-                Cargo.cargo_id.in_(
-                    sorted({l.cargo_id for l in loadings}) or [""]
-                )
-            )
+            select(Cargo).where(Cargo.cargo_id.in_(cargo_ids or [""]))
         ).all()
     }
 
     trip_readings = []
     for r in readings:
-        apps = _trip_reading_application(db, r, loadings, cargos)
+        apps = _trip_reading_application(db, r, loadings, cargos, eff)
         trip_readings.append(
             TripReadingOut(
                 reading_id=r.reading_id,
                 trip_id=r.trip_id,
                 read_at=ensure_utc(r.read_at),
                 temperature=Decimal(r.temperature),
+                effective_temperature=eff.vehicle_temperature(
+                    r.reading_id, Decimal(r.temperature)
+                )[0],
+                temperature_version=eff.vehicle_version_of(r.reading_id),
                 created_at=ensure_utc(r.created_at),
                 applications=apps,
             )
@@ -501,8 +749,8 @@ def _load_cargo(db, cargo_id: str) -> Cargo:
 def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
     """按合并读数时间线返回越温区间（含读数来源）与各责任方片段；未闭合区间标记未结束。"""
     cargo = _load_cargo(db, cargo_id)
-    events, loadings, readings = timeline.load_cargo_context(db, cargo_id)
-    points = timeline.adopted_timeline(events, readings, loadings)
+    events, loadings, readings, eff = timeline.load_cargo_context(db, cargo_id)
+    points = timeline.adopted_timeline(events, readings, loadings, eff)
 
     result = chain.rebuild_chain(
         cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
@@ -529,8 +777,8 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
     实际采用的读数来源；交接（``changes_holder=true``）只来自货物自有事件。
     """
     _load_cargo(db, cargo_id)
-    events, loadings, readings = timeline.load_cargo_context(db, cargo_id)
-    points = timeline.merged_timeline(events, readings, loadings)
+    events, loadings, readings, eff = timeline.load_cargo_context(db, cargo_id)
+    points = timeline.merged_timeline(events, readings, loadings, eff)
     return CargoTimeline(
         cargo_id=cargo_id,
         points=[
@@ -542,6 +790,12 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
                 reading_id=p.source_id if p.source == "vehicle" else None,
                 trip_id=p.trip_id,
                 temperature=(Decimal(p.temperature) if p.is_measurement else None),
+                original_temperature=(
+                    Decimal(p.original_temperature)
+                    if p.is_measurement and p.original_temperature is not None
+                    else (Decimal(p.temperature) if p.is_measurement else None)
+                ),
+                temperature_version=(p.temperature_version if p.is_measurement else 0),
                 giver=p.giver,
                 receiver=p.receiver,
                 adopted=p.adopted,
@@ -601,8 +855,8 @@ def _interval_schema(view) -> ResponsibilityInterval:
 
 def _closed_interval_views(db, cargo: Cargo):
     """在合并时间线上重建并为每个已闭合区间装配责任确认视图（按开始时间升序）。"""
-    events, loadings, readings = timeline.load_cargo_context(db, cargo.cargo_id)
-    result, closed = responsibility.rebuild(cargo, events, loadings, readings)
+    events, loadings, readings, eff = timeline.load_cargo_context(db, cargo.cargo_id)
+    result, closed = responsibility.rebuild(cargo, events, loadings, readings, eff)
     views = []
     for ex in sorted(closed.values(), key=lambda e: e.start):
         rows = stance_crud.load_interval_stances(
@@ -715,8 +969,8 @@ def list_stance_history(
     rows = stance_crud.load_interval_stances(db, cargo_id, interval_id)
 
     # 当前区间状态（不因此报 404/422：历史要始终可查）
-    events, loadings, readings = timeline.load_cargo_context(db, cargo_id)
-    chain_result, closed = responsibility.rebuild(cargo, events, loadings, readings)
+    events, loadings, readings, eff = timeline.load_cargo_context(db, cargo_id)
+    chain_result, closed = responsibility.rebuild(cargo, events, loadings, readings, eff)
     ex = closed.get(interval_id)
     open_ex = next(
         (e for e in chain_result.excursions if chain.interval_id(e) == interval_id),

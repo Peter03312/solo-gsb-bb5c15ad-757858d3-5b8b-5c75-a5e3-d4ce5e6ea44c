@@ -39,6 +39,13 @@ class IntervalSource(str, enum.Enum):
     vehicle = "vehicle"    # 车载测温读数
 
 
+class CorrectionTarget(str, enum.Enum):
+    """测温更正的目标类型。"""
+
+    own = "own"            # 货物自有测温事件
+    vehicle = "vehicle"    # 车载测温读数
+
+
 class Cargo(Base):
     __tablename__ = "cargo"
 
@@ -200,6 +207,75 @@ class VehicleReading(Base):
         DateTime(timezone=True), nullable=False
     )
     temperature: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class TemperatureCorrection(Base):
+    """测温值更正（只追加，原始测温记录永不修改）。
+
+    凭“自有测温事件ID 或 车载读数ID 之一 + 更正ID + 预期版本 + 新温度”提交：
+    * 只改温度，测温时刻、货物归属（自有）与原编号一律不变；交接事件不可更正。
+    * 每次更正产生一条新版本：``version`` 为更正后该目标的当前版本（首次为 1，
+      依次递增），``expected_version`` 为提交时客户端看到的版本（首次提交为 0）。
+    * 车载读数更正对读数时刻仍在该车次车上的**全部货物**同时生效；货物归属列
+      对车载更正为空（受影响货物经装卸时段推导），自有更正记录归属货物。
+    * 更正与相关事件、表态、车载读数及装卸登记在同一套行锁下串行；原始记录
+      按原内容重传仍幂等，更正同编号同内容重传返回原结果，异内容冲突。
+
+    原始测温表（event / vehicle_reading）始终保留首次录入值；重建时间线时
+    以同目标 version 最大的更正温度为“有效温度”（见 app/effective.py）。
+    """
+
+    __tablename__ = "temperature_correction"
+    __table_args__ = (
+        CheckConstraint(
+            "(target_type = 'own' AND event_id IS NOT NULL "
+            "AND reading_id IS NULL AND cargo_id IS NOT NULL) "
+            "OR (target_type = 'vehicle' AND reading_id IS NOT NULL "
+            "AND event_id IS NULL)",
+            name="chk_correction_target",
+        ),
+        CheckConstraint("expected_version >= 0 AND version >= 1", name="chk_correction_version"),
+        # 同一目标的版本号唯一：每个版本只能由一笔更正产生。
+        # PG 下货物行锁已把同目标更正串行；该唯一索引同时为 SQLite（FOR UPDATE
+        # 为空操作）等无行锁环境提供数据库级兜底，杜绝并发产生两条相同版本。
+        Index(
+            "ux_correction_own_event_version",
+            "event_id",
+            "version",
+            unique=True,
+            postgresql_where=text("target_type = 'own'::correction_target"),
+            sqlite_where=text("target_type = 'own'"),
+        ),
+        Index(
+            "ux_correction_reading_version",
+            "reading_id",
+            "version",
+            unique=True,
+            postgresql_where=text("target_type = 'vehicle'::correction_target"),
+            sqlite_where=text("target_type = 'vehicle'"),
+        ),
+    )
+
+    correction_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_type: Mapped[CorrectionTarget] = mapped_column(
+        Enum(CorrectionTarget, name="correction_target", create_constraint=True),
+        nullable=False,
+    )
+    # 目标坐标二选一（event_id 或 reading_id）
+    event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reading_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 自有更正时的归属货物（车载更正为空：受影响货物由装卸时段决定）
+    cargo_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 提交时客户端预期的目标当前版本（无既存更正时为 0）
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    # 本次更正后的版本（同目标历次更正依次递增）
+    version: Mapped[int] = mapped_column(nullable=False)
+    new_temperature: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

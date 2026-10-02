@@ -174,3 +174,96 @@ def test_concurrent_vehicle_reading_and_own_measurement_serialize(client):
     tl = client.get("/cargo/CV/timeline").json()["points"]
     veh = [p for p in tl if p["source"] == "vehicle"]
     assert len(veh) == 1 and veh[0]["adopted"] is False
+
+
+def test_concurrent_corrections_serialize_with_expected_version(client):
+    """同一测温事件的并发更正按货物行锁串行：
+
+    所有线程都以 expected_version=0 提交，只有第一笔成功（版本升到 1）；
+    其余因预期版本过期（stale_version）被拒绝，不产生第二条 v1 记录。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CC2",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    client.post("/events", json={
+        "event_id": "m1", "cargo_id": "CC2",
+        "occurred_at": "2026-01-01T11:00:00+00:00", "temperature": "8"})
+
+    def submit(i):
+        return client.post(
+            "/temperature-corrections",
+            json={
+                "correction_id": f"corr{i}",
+                "event_id": "m1",
+                "expected_version": 0,
+                "new_temperature": str(3 + i),
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit, range(8)))
+
+    assert codes.count(201) == 1
+    assert all(c == 409 for c in codes if c != 201)
+    hist = client.get("/events/m1/corrections").json()
+    assert hist["current_version"] == 1
+    assert len(hist["corrections"]) == 1
+
+
+def test_concurrent_correction_and_event_write_serialize(client):
+    """车载读数更正与受影响货物的事件写入共用货物行锁串行，重建结果确定。"""
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CV2",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post("/trips", json={"trip_id": "TV2", "vehicle_no": "V"}).status_code == 201
+    assert client.post(
+        "/trips/TV2/manifest",
+        json={"items": [{
+            "cargo_id": "CV2",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+    assert client.post("/vehicle-readings", json={
+        "reading_id": "vr1", "trip_id": "TV2",
+        "read_at": "2026-01-01T11:00:00+00:00", "temperature": "2",
+    }).status_code == 201
+
+    def submit_correction(i):
+        return client.post("/temperature-corrections", json={
+            "correction_id": f"vc{i}", "reading_id": "vr1",
+            "expected_version": 0, "new_temperature": "9",
+        }).status_code
+
+    def submit_event(i):
+        # 同刻自有测温 3℃（不越限），若生效则车载读数对 CV2 被取代
+        return client.post("/events", json={
+            "event_id": f"me{i}", "cargo_id": "CV2",
+            "occurred_at": "2026-01-01T11:00:00+00:00", "temperature": "3",
+        }).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        corr_codes = list(pool.map(submit_correction, range(4)))
+        ev_codes = list(pool.map(submit_event, range(4)))
+
+    # 更正只有一笔 v1 成功；自有同刻测温只有一笔
+    assert corr_codes.count(201) == 1
+    assert all(c == 409 for c in corr_codes if c != 201)
+    assert ev_codes.count(201) == 1
+    assert all(c in (409, 422) for c in ev_codes if c != 201)
+    hist = client.get("/vehicle-readings/vr1/corrections").json()
+    assert hist["current_version"] == 1
+    # 同刻自有 3℃ 优先：无论提交先后，货物不越温
+    assert client.get("/cargo/CV2/report").json()["excursions"] == []

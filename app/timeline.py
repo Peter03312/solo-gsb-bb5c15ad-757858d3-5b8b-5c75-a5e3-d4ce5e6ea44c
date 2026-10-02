@@ -10,6 +10,9 @@
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
+from app import effective
 from app.chain import (
     SOURCE_OWN,
     SOURCE_VEHICLE,
@@ -39,15 +42,33 @@ def onboard_loadings(loadings, at) -> list:
     return [l for l in loadings if is_on_board(l, at)]
 
 
-def merged_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoint]:
+def merged_timeline(
+    own_events,
+    vehicle_readings,
+    loadings,
+    eff: effective.EffectiveTemperatures | None = None,
+) -> list[TimelinePoint]:
     """生成货物的完整读数时间线（含被取代的车载点，按时间升序）。
 
     :param own_events: 该货物的全部自有事件（测温 / 交接）。
     :param vehicle_readings: 该货物所有车次的车载原始读数（可含与其无关车次的，
         由 loadings 决定是否适用）。
     :param loadings: 该货物的全部装卸时段登记。
+    :param eff: 测温更正后的有效温度覆盖（自有按事件ID、车载按读数ID）；
+        缺省表示无更正，全部沿用原始温度（版本 0）。
     """
-    points: list[TimelinePoint] = [point_from_event(e) for e in own_events]
+    if eff is None:
+        eff = effective.EffectiveTemperatures.empty()
+
+    def _as_own_point(e):
+        if point_from_event(e).is_measurement:
+            temp, version = eff.own_temperature(e.event_id, e.temperature)
+            return point_from_event(
+                e, temperature_override=temp, temperature_version=version
+            )
+        return point_from_event(e)
+
+    points: list[TimelinePoint] = [_as_own_point(e) for e in own_events]
     own_measure_at = {
         e.occurred_at
         for e in own_events
@@ -59,15 +80,18 @@ def merged_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoin
         if not applicable:
             # 与该货物无关的车次读数（不在车 / 别的车次）完全不出现在其时间线上
             continue
+        eff_temp, version = eff.vehicle_temperature(r.reading_id, r.temperature)
         points.append(
             TimelinePoint(
                 occurred_at=r.read_at,
                 is_measurement=True,
-                temperature=r.temperature,
+                temperature=eff_temp,
                 source=SOURCE_VEHICLE,
                 source_id=r.reading_id,
                 trip_id=r.trip_id,
                 adopted=r.read_at not in own_measure_at,
+                temperature_version=version,
+                original_temperature=Decimal(r.temperature),
             )
         )
     points.sort(
@@ -81,17 +105,28 @@ def merged_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoin
     return points
 
 
-def adopted_timeline(own_events, vehicle_readings, loadings) -> list[TimelinePoint]:
+def adopted_timeline(
+    own_events,
+    vehicle_readings,
+    loadings,
+    eff: effective.EffectiveTemperatures | None = None,
+) -> list[TimelinePoint]:
     """只含被采用点的时间线，供保管链重建使用。"""
-    return [p for p in merged_timeline(own_events, vehicle_readings, loadings)
-            if p.adopted]
+    return [
+        p
+        for p in merged_timeline(own_events, vehicle_readings, loadings, eff)
+        if p.adopted
+    ]
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数。"""
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数与有效温度覆盖。
+
+    返回 ``(events, loadings, readings, eff)``。
+    """
     from sqlalchemy import select
 
-    from app.models import Event, Loading, Trip, VehicleReading
+    from app.models import Event, Loading, VehicleReading
     from app.timeutil import ensure_utc
 
     events = list(
@@ -130,7 +165,16 @@ def load_cargo_context(db, cargo_id: str):
         # 仅按关系惰性引用，trip 行由车次查询单独获取
         readings = rows
 
-    return events, loadings, readings
+    eff = effective.load_target_corrections(
+        db,
+        event_ids=[
+            e.event_id
+            for e in events
+            if e.event_type.name == "measurement"
+        ],
+        reading_ids=[r.reading_id for r in readings],
+    )
+    return events, loadings, readings, eff
 
 
 def resolve_trip_for_reading(db, trip_id: str):

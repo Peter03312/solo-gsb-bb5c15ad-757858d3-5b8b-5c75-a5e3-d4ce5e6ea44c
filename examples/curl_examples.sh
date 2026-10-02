@@ -283,3 +283,69 @@ curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
 curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
   --data-urlencode "start_at=2026-09-30T00:00:00" \
   --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
+
+echo
+echo "================ 本轮新增：测温值更正 ================"
+# 演示：$CA 在 10:00 被车载读数 vr-1（7℃）开启越温。
+echo "33) 更正前 $CA 报告（10:00 车载 7℃ 开启越温，区间标识 veh:vr-1）"
+curl -sS "$BASE/cargo/$CA/report" | python3 -m json.tool; echo
+
+echo "34) 自有测温更正：把 ca-own-1（11:00，原值 3.1℃）更正为 9.0℃"
+echo "    只改温度：时间 / 归属 / 事件ID 不变；预期版本 0 表示此前未更正"
+curl -sS -X POST "$BASE/temperature-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"corr-own-1\",
+    \"event_id\": \"ca-own-1\",
+    \"expected_version\": 0,
+    \"new_temperature\": \"9.0\"
+  }" | python3 -m json.tool; echo
+
+echo "35) 原始事件查询：temperature 仍为原值 3.1℃，另给有效温度 9.0℃ 与版本 1"
+curl -sS "$BASE/cargo/$CA/events" | python3 -m json.tool; echo
+
+echo "36) 车载读数更正：把 vr-1（10:00，原值 7.0℃）更正为 2.0℃"
+echo "    车载更正同时影响读数时刻在车上的全部货物（$CA、$CB、$CQ）"
+curl -sS -X POST "$BASE/temperature-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"corr-vr-1\",
+    \"reading_id\": \"vr-1\",
+    \"expected_version\": 0,
+    \"new_temperature\": \"2.0\"
+  }" | python3 -m json.tool; echo
+
+echo "37) 更正后 $CA 报告：10:00 车载 2℃ 不越温（区间起点消失），同刻自有仍优先"
+curl -sS "$BASE/cargo/$CA/report" | python3 -m json.tool; echo
+
+echo "38) 更正ID幂等：同内容重传返回 200 replayed（原结果）"
+curl -sS -X POST "$BASE/temperature-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"corr-vr-1\",
+    \"reading_id\": \"vr-1\",
+    \"expected_version\": 0,
+    \"new_temperature\": \"2.0\"
+  }"; echo
+
+echo "39) 版本过期：仍以 expected_version=0 再次更正 -> 409 stale_version"
+curl -sS -X POST "$BASE/temperature-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"corr-vr-2\",
+    \"reading_id\": \"vr-1\",
+    \"expected_version\": 0,
+    \"new_temperature\": \"1.5\"
+  }"; echo
+
+echo "40) 交接不可更正：对交接事件 ca-h1 更正 -> 422 target_not_correctable"
+curl -sS -X POST "$BASE/temperature-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"corr-bad\",
+    \"event_id\": \"ca-h1\",
+    \"expected_version\": 0,
+    \"new_temperature\": \"9.0\"
+  }"; echo
+
+echo "41) 读数更正历史：原始温度 7.0℃、当前有效 2.0℃、版本与历次更正"
+curl -sS "$BASE/vehicle-readings/vr-1/corrections" | python3 -m json.tool; echo
+
+echo "42) 事件更正历史 + 按更正ID直查"
+curl -sS "$BASE/events/ca-own-1/corrections" | python3 -m json.tool; echo
+curl -sS "$BASE/temperature-corrections/corr-own-1" | python3 -m json.tool; echo

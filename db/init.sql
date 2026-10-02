@@ -5,6 +5,7 @@
 CREATE TYPE event_type AS ENUM ('measurement', 'handover');
 CREATE TYPE stance_kind AS ENUM ('confirm', 'dispute');
 CREATE TYPE interval_source AS ENUM ('own', 'vehicle');
+CREATE TYPE correction_target AS ENUM ('own', 'vehicle');
 
 CREATE TABLE IF NOT EXISTS cargo (
     cargo_id          VARCHAR(64)   PRIMARY KEY,
@@ -139,3 +140,45 @@ CREATE TABLE IF NOT EXISTS responsibility_stance (
 
 CREATE INDEX IF NOT EXISTS ix_stance_cargo_interval
     ON responsibility_stance (cargo_id, interval_key);
+
+-- 测温值更正（只追加；原始 event / vehicle_reading 温度永不修改）。
+-- 凭 自有测温事件ID 或 车载读数ID 之一 + 更正ID + 预期版本 + 新温度提交；
+-- 只改温度，时刻 / 归属 / 原编号不变，交接不可更正。
+-- 车载更正不记录归属货物（cargo_id 为空）：对读数时刻在车的全部货物生效。
+CREATE TABLE IF NOT EXISTS temperature_correction (
+    correction_id      VARCHAR(64)   PRIMARY KEY,
+    target_type        correction_target NOT NULL,
+    event_id           VARCHAR(64),   -- target_type='own' 时有值（测温事件）
+    reading_id         VARCHAR(64),   -- target_type='vehicle' 时有值（车载读数）
+    cargo_id           VARCHAR(64),   -- 自有更正的归属货物；车载更正为空
+    expected_version   INTEGER       NOT NULL,
+    version            INTEGER       NOT NULL,
+    new_temperature    NUMERIC(10,3) NOT NULL,
+    created_at         TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    -- 目标坐标二选一：自有测温事件（须带归属货物） 或 车载读数（不带归属货物）
+    CONSTRAINT chk_correction_target CHECK (
+        (target_type = 'own'
+            AND event_id IS NOT NULL
+            AND reading_id IS NULL
+            AND cargo_id IS NOT NULL)
+        OR
+        (target_type = 'vehicle'
+            AND reading_id IS NOT NULL
+            AND event_id IS NULL)
+    ),
+
+    -- 版本：首次提交 expected=0、version=1，依次递增
+    CONSTRAINT chk_correction_version CHECK (expected_version >= 0 AND version >= 1)
+);
+
+-- 同一目标的版本号唯一（每个版本只能由一笔更正产生）。
+-- PG 下货物行锁已把同目标更正串行；该唯一索引同时为无行锁环境（如 SQLite）
+-- 提供数据库级兜底，杜绝并发产生两条相同版本（落败方按 stale_version 拒绝）。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_correction_own_event_version
+    ON temperature_correction (event_id, version)
+    WHERE target_type = 'own';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_correction_reading_version
+    ON temperature_correction (reading_id, version)
+    WHERE target_type = 'vehicle';

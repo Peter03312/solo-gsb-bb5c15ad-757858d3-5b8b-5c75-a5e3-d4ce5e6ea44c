@@ -228,11 +228,13 @@ def rebuild(
     own_events,
     loadings=None,
     vehicle_readings=None,
+    eff=None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
     """在合并读数时间线上重建保管链，返回（重建结果, 区间标识 -> 闭合区间）。
 
     ``own_events`` 为货物自有事件；``loadings`` / ``vehicle_readings``
     为该货物的装卸时段与相关车载读数（缺省时退化为仅自有事件，兼容旧调用）。
+    ``eff`` 为测温更正后的有效温度覆盖（缺省时无更正）。
     """
     from app import chain, timeline
 
@@ -240,7 +242,7 @@ def rebuild(
         items = list(own_events)
     else:
         items = timeline.adopted_timeline(
-            own_events, vehicle_readings, loadings
+            own_events, vehicle_readings, loadings, eff
         )
     result = chain.rebuild_chain(
         cargo.initial_holder, Decimal(cargo.temp_upper_limit), items

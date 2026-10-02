@@ -395,6 +395,104 @@ def main() -> None:
             ),
         )
 
+        # ==================== 测温值更正 ====================
+        # 背景：10:00 车载读数 py-vr1（原始 7℃）开启了 A 的越温区间；
+        # 11:00 A 有自有测温 py-ca-own1（原始 3.1℃），同刻车载读数被取代。
+        show(
+            "更正前 A 报告（10:00 车载 7℃ 开启区间 veh:py-vr1）",
+            api.get(f"/cargo/{cargo_a}/report"),
+        )
+
+        # 自有测温更正：把 11:00 的 3.1℃ 更正为 9.0℃
+        # 只改温度（时间 / 归属 / 事件ID 不变）；expected_version=0 表示此前未更正
+        show(
+            "自有测温更正 py-ca-own1：3.1 -> 9.0",
+            api.post(
+                "/temperature-corrections",
+                json={
+                    "correction_id": "py-corr-own-1",
+                    "event_id": "py-ca-own1",
+                    "expected_version": 0,
+                    "new_temperature": "9.0",
+                },
+            ),
+        )
+
+        # 车载读数更正：把 10:00 的 7.0℃ 更正为 2.0℃
+        # 车载更正同时影响读数时刻仍在车上的全部货物（A / B / Q）
+        show(
+            "车载读数更正 py-vr1：7.0 -> 2.0（影响在车全部货物）",
+            api.post(
+                "/temperature-corrections",
+                json={
+                    "correction_id": "py-corr-vr-1",
+                    "reading_id": "py-vr1",
+                    "expected_version": 0,
+                    "new_temperature": "2.0",
+                },
+            ),
+        )
+
+        # 更正后按有效温度重建：10:00 车载 2℃ 不开启区间
+        show(
+            "更正后 A 报告（区间起点消失）",
+            api.get(f"/cargo/{cargo_a}/report"),
+        )
+        # 原始事件查询：temperature 恒为原始值，另给有效温度与版本
+        show(
+            "原始事件列表（temperature 原值 + effective_temperature/version）",
+            api.get(f"/cargo/{cargo_a}/events"),
+        )
+
+        # 同更正ID同内容重传 -> 200 replayed（返回原结果）
+        show(
+            "车载更正幂等重传",
+            api.post(
+                "/temperature-corrections",
+                json={
+                    "correction_id": "py-corr-vr-1",
+                    "reading_id": "py-vr1",
+                    "expected_version": 0,
+                    "new_temperature": "2.0",
+                },
+            ),
+        )
+        # 版本过期：仍以 0 再次更正 -> 409 stale_version
+        show(
+            "版本过期更正（409 stale_version）",
+            api.post(
+                "/temperature-corrections",
+                json={
+                    "correction_id": "py-corr-vr-stale",
+                    "reading_id": "py-vr1",
+                    "expected_version": 0,
+                    "new_temperature": "1.5",
+                },
+            ),
+        )
+        # 交接不可更正 -> 422 target_not_correctable
+        show(
+            "交接目标更正（422 target_not_correctable）",
+            api.post(
+                "/temperature-corrections",
+                json={
+                    "correction_id": "py-corr-handover",
+                    "event_id": "py-ca-h1",
+                    "expected_version": 0,
+                    "new_temperature": "9.0",
+                },
+            ),
+        )
+        # 历次更正可查 + 按更正ID直查
+        show(
+            "车载读数更正历史（原始温度 / 有效温度 / 版本 / 历次更正）",
+            api.get("/vehicle-readings/py-vr1/corrections"),
+        )
+        show(
+            "按更正ID直查单条",
+            api.get("/temperature-corrections/py-corr-own-1"),
+        )
+
 
 if __name__ == "__main__":
     main()

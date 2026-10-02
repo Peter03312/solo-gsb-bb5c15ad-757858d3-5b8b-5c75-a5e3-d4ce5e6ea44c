@@ -60,9 +60,19 @@ class EventOut(BaseModel):
     cargo_id: str
     event_type: EventType
     occurred_at: datetime
+    # 原始录入温度（测温事件）；测温更正后仍保持原值不变
     temperature: Decimal | None
     giver: str | None
     receiver: str | None
+    # 更正后的有效温度与当前版本（交接事件为 null；无更正时版本 0 且等于原始值）
+    effective_temperature: Decimal | None = Field(
+        default=None,
+        description="测温更正后的有效温度；交接为 null",
+    )
+    temperature_version: int = Field(
+        default=0,
+        description="测温当前版本：0=原始值，>0=已更正到第 N 版",
+    )
 
 
 class ResponsibilitySegment(BaseModel):
@@ -350,7 +360,15 @@ class VehicleReadingOut(BaseModel):
     reading_id: str
     trip_id: str
     read_at: datetime
+    # 原始读数温度；读数更正后仍保持原值，可查
     temperature: Decimal
+    # 更正后的有效温度与当前版本（无更正时版本 0 且等于原始值）
+    effective_temperature: Decimal = Field(
+        ..., description="更正后的有效温度；未更正时等于原始温度"
+    )
+    temperature_version: int = Field(
+        ..., description="读数当前版本：0=原始值，>0=已更正到第 N 版"
+    )
     created_at: datetime
 
 
@@ -386,7 +404,18 @@ class ReadingApplication(BaseModel):
     )
     over_limit: bool | None = Field(
         ...,
-        description="按该货物自身温度上限是否越温；不在车上时为 null"
+        description="按该货物自身温度上限、以有效温度判断是否越温；不在车上时为 null",
+    )
+    applied_temperature: Decimal | None = Field(
+        ...,
+        description="实际用于该货物判断的温度：在车上为读数有效温度"
+        "（含更正），同刻有自有测温时为该自有测温的有效温度；不在车上为 null",
+    )
+    reading_temperature: Decimal = Field(
+        ..., description="读数当前有效温度（含更正；原始温度见 readings[].temperature）"
+    )
+    reading_temperature_version: int = Field(
+        ..., description="读数温度版本：0=原始值，>0=已更正到第 N 版"
     )
     reason: str = Field(
         ...,
@@ -420,7 +449,16 @@ class TimelinePointOut(BaseModel):
     event_id: str | None = Field(..., description="自有事件ID（车载点为 null）")
     reading_id: str | None = Field(..., description="车载读数ID（自有为 null）")
     trip_id: str | None = Field(..., description="车载读数所属车次")
-    temperature: Decimal | None
+    temperature: Decimal | None = Field(
+        ..., description="该时刻采用的有效温度（含更正）；交接为 null"
+    )
+    original_temperature: Decimal | None = Field(
+        ...,
+        description="原始录入温度（测温点；被更正时与 temperature 不同）；交接为 null",
+    )
+    temperature_version: int = Field(
+        ..., description="测温版本：0=原始值，>0=已更正到第 N 版；交接为 0"
+    )
     giver: str | None
     receiver: str | None
     adopted: bool = Field(
@@ -464,4 +502,99 @@ class SimultaneousExcursionReport(BaseModel):
         ...,
         description="同时越温货物数达到门槛的正长度片段；集合变化即分段，"
         "相邻同集合片段已合并；无匹配时为空列表",
+    )
+
+
+# ----------------------------------------------------- 测温值更正
+
+
+class TemperatureCorrectionCreate(BaseModel):
+    """测温值更正提交。
+
+    目标二选一：``event_id``（货物自有测温事件）或 ``reading_id``（车载读数）；
+    只改温度，时刻 / 归属 / 原编号不变。``expected_version`` 为提交前查询到的
+    目标当前版本（从未更正时为 0），与服务端不一致即拒绝（版本过期）。
+    """
+
+    correction_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="更正编号（客户端指定）；同编号同内容重传返回原结果",
+    )
+    event_id: str | None = Field(
+        default=None, min_length=1, max_length=64, description="目标：自有测温事件ID"
+    )
+    reading_id: str | None = Field(
+        default=None, min_length=1, max_length=64, description="目标：车载读数ID"
+    )
+    expected_version: int = Field(
+        ..., ge=0, description="预期的目标当前版本（从未更正为 0）"
+    )
+    new_temperature: Decimal = Field(..., description="更正后的温度（摄氏度）")
+
+
+class TemperatureCorrectionOut(BaseModel):
+    """一条测温更正记录。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    correction_id: str
+    target_type: str = Field(..., description="目标类型：own=自有测温；vehicle=车载读数")
+    event_id: str | None = Field(..., description="自有测温目标事件ID（车载更正为 null）")
+    reading_id: str | None = Field(..., description="车载目标读数ID（自有更正为 null）")
+    cargo_id: str | None = Field(
+        ..., description="自有更正的归属货物；车载更正为 null（影响在车全部货物）"
+    )
+    expected_version: int
+    version: int = Field(..., description="本次更正后的目标版本（1 起递增）")
+    new_temperature: Decimal = Field(..., description="更正后的有效温度")
+    created_at: datetime
+
+
+class TemperatureCorrectionAck(BaseModel):
+    """测温更正回执：更正记录 + 当前有效温度/版本 + 受影响货物。"""
+
+    correction: TemperatureCorrectionOut
+    target_type: str
+    target_id: str = Field(..., description="目标编号（事件ID 或 读数ID）")
+    cargo_id: str | None = Field(..., description="自有更正的归属货物；车载为 null")
+    effective_temperature: Decimal = Field(..., description="更正后的当前有效温度")
+    temperature_version: int = Field(..., description="更正后的当前版本")
+    affected_cargo_ids: list[str] = Field(
+        ...,
+        description="本次更正影响的货物：自有=归属货物单元素；"
+        "车载=读数时刻仍在车上的全部货物（可能为空）",
+    )
+
+
+class TemperatureCorrectionReplay(BaseModel):
+    """同更正ID同内容重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    correction: TemperatureCorrectionOut
+    target_type: str
+    target_id: str
+    cargo_id: str | None
+    effective_temperature: Decimal
+    temperature_version: int
+    affected_cargo_ids: list[str]
+    message: str
+
+
+class TemperatureCorrectionHistory(BaseModel):
+    """某测温目标（自有事件 / 车载读数）的原始温度与历次更正。"""
+
+    target_type: str
+    target_id: str
+    cargo_id: str | None = Field(..., description="自有测温的归属货物；车载为 null")
+    trip_id: str | None = Field(..., description="车载读数所属车次；自有为 null")
+    target_at: datetime = Field(
+        ..., description="测温时刻（自有事件 occurred_at / 读数 read_at，更正不改变）"
+    )
+    original_temperature: Decimal = Field(..., description="原始录入温度（永不改变）")
+    current_version: int = Field(..., description="当前版本：0=未更正")
+    effective_temperature: Decimal = Field(..., description="当前有效温度")
+    corrections: list[TemperatureCorrectionOut] = Field(
+        ..., description="历次更正（按版本升序）；未更正时为空列表"
     )

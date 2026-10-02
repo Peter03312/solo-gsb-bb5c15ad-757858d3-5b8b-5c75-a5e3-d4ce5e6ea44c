@@ -49,21 +49,38 @@ class TimelinePoint:
     source_id: str | None = None      # 自有=event_id；车载=reading_id
     trip_id: str | None = None
     adopted: bool = True
+    # 测温点当前温度的更正版本：0=原始温度，>0=已被第 N 次更正覆盖（有效温度）
+    temperature_version: int = 0
+    # 车载点原始温度（被更正时与 temperature 不同；其余场景恒等于 temperature）
+    original_temperature: Decimal | None = None
 
     @property
     def is_handover(self) -> bool:
         return not self.is_measurement
 
 
-def point_from_event(e: Event) -> TimelinePoint:
-    """自有事件 ORM 对象 -> 时间线点。"""
+def point_from_event(
+    e: Event,
+    temperature_override: Decimal | None = None,
+    temperature_version: int = 0,
+) -> TimelinePoint:
+    """自有事件 ORM 对象 -> 时间线点。
+
+    测温事件被更正时以 ``temperature_override``（有效温度）与版本覆盖；
+    时刻、货物归属与事件ID不变。
+    """
     if e.event_type is EventType.measurement:
+        temp = Decimal(e.temperature)
+        if temperature_override is not None:
+            temp = Decimal(temperature_override)
         return TimelinePoint(
             occurred_at=e.occurred_at,
             is_measurement=True,
-            temperature=Decimal(e.temperature),
+            temperature=temp,
+            original_temperature=Decimal(e.temperature),
             source=SOURCE_OWN,
             source_id=e.event_id,
+            temperature_version=temperature_version,
         )
     return TimelinePoint(
         occurred_at=e.occurred_at,
@@ -82,6 +99,8 @@ def measurement_point(
     source_id: str | None = None,
     trip_id: str | None = None,
     adopted: bool = True,
+    temperature_version: int = 0,
+    original_temperature: Decimal | None = None,
 ) -> TimelinePoint:
     return TimelinePoint(
         occurred_at=occurred_at,
@@ -91,6 +110,12 @@ def measurement_point(
         source_id=source_id,
         trip_id=trip_id,
         adopted=adopted,
+        temperature_version=temperature_version,
+        original_temperature=(
+            Decimal(original_temperature)
+            if original_temperature is not None
+            else Decimal(temperature)
+        ),
     )
 
 
